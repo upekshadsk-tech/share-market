@@ -21,6 +21,10 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 from yfinance import EquityQuery as Q
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from signals import add_indicators, summarise
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
@@ -206,7 +210,8 @@ with st.sidebar:
 st.title("📈 Stock Tracker: USA · Australia · New Zealand")
 market_clocks()
 
-tab_movers, tab_watch, tab_pick = st.tabs(["🔥 Big Movers", "⭐ My Watchlist", "➕ Pick Companies"])
+tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
+    ["🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
 
 # ---------------------------------------------------------------- 1. Big movers
 with tab_movers:
@@ -273,7 +278,144 @@ with tab_watch:
             save_watchlist([s for s in st.session_state.watchlist if s not in remove])
             st.rerun()
 
-# ---------------------------------------------------------------- 3. Pick companies
+
+# ---------------------------------------------------------------- 1-minute bars
+@st.cache_data(ttl=30, show_spinner=False)
+def bars_1m(symbol: str) -> pd.DataFrame:
+    """Last 5 trading days of 1-minute bars (Yahoo's limit for 1m data is ~7 days)."""
+    h = yf.Ticker(symbol).history(period="5d", interval="1m", prepost=False)
+    return h[["Open", "High", "Low", "Close", "Volume"]].dropna() if not h.empty else h
+
+
+def bars_many(symbols: tuple[str, ...]) -> dict:
+    def one(s):
+        try:
+            return s, bars_1m(s)
+        except Exception:
+            return s, pd.DataFrame()
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        return dict(pool.map(one, symbols))
+
+
+def live_chart(symbol: str, d: pd.DataFrame, proj_minutes: int):
+    today = d[d.index.date == d.index[-1].date()]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(x=today.index, open=today["Open"], high=today["High"], low=today["Low"],
+                                 close=today["Close"], name="Price",
+                                 increasing_line_color="#16a34a", decreasing_line_color="#dc2626"), 1, 1)
+    for col, colr in (("EMA9", "#f59e0b"), ("EMA21", "#3b82f6"), ("VWAP", "#a855f7")):
+        fig.add_trace(go.Scatter(x=today.index, y=today[col], name=col, line=dict(width=1.3, color=colr)), 1, 1)
+    # Trend projection with uncertainty band
+    from signals import projection
+    p = projection(d, proj_minutes)
+    if p:
+        t0 = today.index[-1]
+        t1 = t0 + pd.Timedelta(minutes=proj_minutes)
+        last = float(today["Close"].iloc[-1])
+        fig.add_trace(go.Scatter(x=[t0, t1, t1, t0], y=[last, p["high"], p["low"], last], fill="toself",
+                                 fillcolor="rgba(148,163,184,.25)", line=dict(width=0), name="Likely range",
+                                 hoverinfo="skip"), 1, 1)
+        fig.add_trace(go.Scatter(x=[t0, t1], y=[last, p["target"]], name=f"Trend +{proj_minutes}m",
+                                 line=dict(dash="dot", color="#64748b")), 1, 1)
+    colors = ["#16a34a" if c >= o else "#dc2626" for o, c in zip(today["Open"], today["Close"])]
+    fig.add_trace(go.Bar(x=today.index, y=today["Volume"], marker_color=colors, name="Volume", showlegend=False), 2, 1)
+    fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.08), title=f"{symbol} · today, 1-minute bars")
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+
+# ---------------------------------------------------------------- 3. Live chart
+with tab_chart:
+    if not st.session_state.watchlist:
+        st.info("Add companies to your watchlist first.")
+    else:
+        c1, c2 = st.columns([3, 1])
+        sym = c1.selectbox("Company", st.session_state.watchlist, key="chart_sym")
+        proj_min = c2.selectbox("Project ahead", [5, 10, 15], format_func=lambda m: f"{m} min")
+
+        @st.fragment(run_every=refresh)
+        def chart_view():
+            try:
+                raw = bars_1m(sym)
+            except Exception as e:
+                st.warning(f"No data for {sym} ({e}).")
+                return
+            if raw.empty:
+                st.info("No intraday data yet (market closed or ticker not found).")
+                return
+            d = add_indicators(raw)
+            last, prev_close = d.iloc[-1], d[d.index.date < d.index[-1].date()]["Close"]
+            ref = prev_close.iloc[-1] if not prev_close.empty else d["Open"].iloc[0]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Price", f"{last['Close']:,.3f}", f"{(last['Close'] / ref - 1) * 100:+.2f}%")
+            m2.metric("Last 5 min", f"{last['Mom5']:+.2f}%" if pd.notna(last["Mom5"]) else "–")
+            m3.metric("RSI", f"{last['RSI']:.0f}" if pd.notna(last["RSI"]) else "–",
+                      help="Above 70 = stretched up, below 30 = stretched down")
+            m4.metric("Volume vs normal", f"{last['VolSurge']:.1f}×" if pd.notna(last["VolSurge"]) else "–")
+            live_chart(sym, d, proj_min)
+            st.caption(f"Last bar {d.index[-1]:%H:%M} exchange time · refreshed {datetime.now():%H:%M:%S}. "
+                       "Grey cone = where a straight-line trend of the last 15 minutes would land, "
+                       "with its normal noise. It is a guide, not a forecast.")
+        chart_view()
+
+# ---------------------------------------------------------------- 4. Signals
+with tab_signals:
+    st.markdown("**Which of my stocks look ready to move in the next few minutes?**")
+    horizon = st.radio("Look ahead", [5, 10, 15], horizontal=True, format_func=lambda m: f"{m} min")
+
+    @st.fragment(run_every=max(refresh, 30))
+    def signals_view():
+        wl = tuple(s for s in st.session_state.watchlist if market_of(s) in chosen_markets)
+        if not wl:
+            st.info("Add companies to your watchlist first.")
+            return
+        rows = []
+        for s, d in bars_many(wl).items():
+            if d is not None and len(d) > 30:
+                try:
+                    rows.append(summarise(s, d, horizon))
+                except Exception:
+                    pass
+        if not rows:
+            st.info("No intraday data available right now.")
+            return
+        df = pd.DataFrame(rows)
+        df["_rank"] = df["Score"].abs() * 10 + df["Activity ×"].fillna(0)
+        df = df.sort_values("_rank", ascending=False).drop(columns="_rank")
+
+        hot = df[(df["Activity ×"] >= 1.5) | (df["Score"].abs() >= 3)]
+        if not hot.empty:
+            st.warning("⚡ Watch now: " + ", ".join(f"{r.Symbol} ({r.Signal})" for r in hot.itertuples()))
+
+        fmt = {"Price": "{:,.3f}", f"Next {horizon} min (trend)": "{:,.3f}", "Range low": "{:,.3f}",
+               "Range high": "{:,.3f}", "Last 5 min %": "{:+.2f}%", "RSI": "{:.0f}",
+               "Volume surge ×": "{:.1f}×", "Activity ×": "{:.1f}×", "Signal right % (5d)": "{:.0f}%",
+               "Bar time": lambda t: f"{t:%H:%M}"}
+        sig_color = lambda v: ("color:#16a34a;font-weight:600" if "Up" in str(v)
+                               else "color:#dc2626;font-weight:600" if "Down" in str(v) else "")
+        trust = lambda v: ("" if pd.isna(v) else "background-color:rgba(22,163,74,.18)" if v >= 55
+                           else "background-color:rgba(220,38,38,.15)" if v < 50 else "")
+        st.dataframe(df.style.format(fmt, na_rep="–").map(sig_color, subset=["Signal"])
+                     .map(trust, subset=["Signal right % (5d)"]), hide_index=True, width="stretch")
+        st.caption(f"Updated {datetime.now():%H:%M:%S}")
+    signals_view()
+
+    with st.expander("How to read this (please read)"):
+        st.markdown("""
+- **Signal / Score (-4 to +4)** adds up four things: short trend (EMA9 vs EMA21), the last 5 minutes' move,
+  price above/below VWAP (today's average traded price), and RSI being stretched (which often snaps back).
+  +2 or more = up bias, -2 or less = down bias.
+- **Activity ×** compares the last 5 minutes' volume and price range with normal. Above 1.5× means the
+  stock is waking up, and a bigger move is more likely, in either direction.
+- **Signal right % (5d)** tests the same rule on every minute of the last 5 days: when it said up/down,
+  how often was the price actually up/down N minutes later? **50% is a coin flip.** Only trust stocks
+  where this stays clearly above 55% with plenty of tests, and it can change any day.
+- ASX/NZX data is ~20 min delayed, so their "next 5 minutes" has already happened on the exchange.
+  Signals are most useful for US stocks.
+- This is a technical guide, not financial advice. Nobody can reliably predict the next move.
+""")
+
+# ---------------------------------------------------------------- 5. Pick companies
 with tab_pick:
     market = st.radio("Market", list(MARKETS), horizontal=True)
     try:
