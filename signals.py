@@ -102,3 +102,45 @@ def summarise(symbol: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         "Tests": n,
         "Bar time": d.index[-1],
     }
+
+
+def atr_5m(df: pd.DataFrame, periods: int = 14) -> float | None:
+    """Average True Range on 5-minute bars: how far the price typically moves in 5 minutes."""
+    b = df.resample("5min").agg({"High": "max", "Low": "min", "Close": "last"}).dropna()
+    if len(b) < periods + 1:
+        return None
+    prev = b["Close"].shift()
+    tr = pd.concat([b["High"] - b["Low"], (b["High"] - prev).abs(), (b["Low"] - prev).abs()], axis=1).max(axis=1)
+    return float(tr.tail(periods).mean())
+
+
+def trade_idea(symbol: str, df: pd.DataFrame, horizon: int, account: float, risk_pct: float,
+               stop_atr: float = 1.5, reward_ratio: float = 2.0) -> dict | None:
+    """Turn the current signal into a concrete plan: entry, stop-loss, target, size."""
+    s = summarise(symbol, df, horizon)
+    if s["Score"] == 0:
+        return None
+    atr = atr_5m(df)
+    if not atr:
+        return None
+    side = "BUY" if s["Score"] > 0 else "SELL"
+    price = s["Price"]
+    risk_per_share = stop_atr * atr
+    if side == "BUY":
+        stop, target = price - risk_per_share, price + reward_ratio * risk_per_share
+    else:
+        stop, target = price + risk_per_share, price - reward_ratio * risk_per_share
+    shares = int((account * risk_pct / 100) // risk_per_share) if risk_per_share > 0 else 0
+    shares = min(shares, int(account // price))  # never more than the account can pay for
+    hr = s["Signal right % (5d)"] or 0
+    dollar_vol = float((df["Close"] * df["Volume"]).tail(30).mean())
+    # Quality: edge over a coin flip x signal strength x how active the stock is right now
+    quality = max(hr - 50, 0) * abs(s["Score"]) * min(max(s["Activity ×"] or 1, 0.5), 3)
+    return {
+        "Symbol": symbol, "Action": side, "Price": price,
+        "Stop-loss": stop, "Target": target,
+        "Shares": shares, "Risk $": shares * risk_per_share, "Reward $": shares * reward_ratio * risk_per_share,
+        "Score": s["Score"], "Signal right %": s["Signal right % (5d)"], "Tests": s["Tests"],
+        "Activity ×": s["Activity ×"], "RSI": s["RSI"], "$ traded / min": dollar_vol,
+        "Quality": quality, "Bar time": s["Bar time"],
+    }

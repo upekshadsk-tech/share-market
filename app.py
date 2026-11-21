@@ -24,7 +24,7 @@ from yfinance import EquityQuery as Q
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from signals import add_indicators, summarise
+from signals import add_indicators, summarise, trade_idea
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
@@ -210,8 +210,122 @@ with st.sidebar:
 st.title("📈 Stock Tracker: USA · Australia · New Zealand")
 market_clocks()
 
-tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
-    ["🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
+tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
+    ["🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
+
+# ---------------------------------------------------------------- 1-minute bars
+@st.cache_data(ttl=10, show_spinner=False)
+def bars_1m(symbol: str) -> pd.DataFrame:
+    """Last 5 trading days of 1-minute bars (Yahoo's limit for 1m data is ~7 days)."""
+    h = yf.Ticker(symbol).history(period="5d", interval="1m", prepost=False)
+    return h[["Open", "High", "Low", "Close", "Volume"]].dropna() if not h.empty else h
+
+
+def bars_many(symbols: tuple[str, ...]) -> dict:
+    def one(s):
+        try:
+            return s, bars_1m(s)
+        except Exception:
+            return s, pd.DataFrame()
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        return dict(pool.map(one, symbols))
+
+
+# ---------------------------------------------------------------- 0. Trade ideas
+@st.cache_data(ttl=120, show_spinner=False)
+def scan_universe(markets: tuple[str, ...], watchlist: tuple[str, ...]) -> list[str]:
+    """Watchlist + today's most active and biggest-moving stocks in each chosen market."""
+    syms = list(watchlist)
+    for m in markets:
+        try:
+            base = [_base_query(m), Q("gt", ["intradayprice", 1]), Q("gt", ["dayvolume", 200_000])]
+            for sort_field, asc in (("dayvolume", False), ("percentchange", False), ("percentchange", True)):
+                syms += [r["symbol"] for r in _screen_rows(Q("and", base), sort_field, asc, size=10)]
+        except Exception:
+            pass
+    return list(dict.fromkeys(syms))[:45]
+
+
+with tab_ideas:
+    st.markdown("**Best buy / sell setups right now**, ranked by how reliable the signal has been "
+                "for each stock and how active it is.")
+    c1, c2, c3 = st.columns(3)
+    account = c1.number_input("My trading money ($)", 100.0, 10_000_000.0, 5000.0, 500.0)
+    risk_pct = c2.number_input("Risk per trade (%)", 0.25, 5.0, 1.0, 0.25,
+                               help="Max you lose if the stop-loss is hit. 1% is a common rule.")
+    idea_h = c3.selectbox("Hold for about", [5, 10, 15, 30], index=1, format_func=lambda m: f"{m} min")
+    c4, c5 = st.columns(2)
+    min_hit = c4.slider("Only show if signal was right at least (%)", 50, 70, 55)
+    min_tests = c5.slider("...over at least this many past tests", 20, 500, 100, 20)
+
+    @st.fragment(run_every=max(refresh, 30))
+    def ideas_view():
+        universe = scan_universe(tuple(chosen_markets),
+                                 tuple(s for s in st.session_state.watchlist if market_of(s) in chosen_markets))
+        if not universe:
+            st.info("Pick at least one market in Settings.")
+            return
+        with st.spinner(f"Scanning {len(universe)} stocks..."):
+            ideas = []
+            for s, d in bars_many(tuple(universe)).items():
+                if d is None or len(d) < 120:
+                    continue
+                try:
+                    i = trade_idea(s, d, idea_h, account, risk_pct)
+                except Exception:
+                    i = None
+                if i:
+                    i["Market"] = market_of(s)
+                    ideas.append(i)
+        if not ideas:
+            st.info("No intraday data right now: the markets may be closed.")
+            return
+        df = pd.DataFrame(ideas)
+        now = pd.Timestamp.now(tz="UTC")
+        df["Live"] = df["Bar time"].apply(lambda t: (now - t.tz_convert("UTC")) < pd.Timedelta(minutes=30))
+        good = df[(df["Signal right %"].fillna(0) >= min_hit) & (df["Tests"] >= min_tests)
+                  & (df["Score"].abs() >= 2) & (df["Shares"] > 0)]
+        good = good.sort_values("Quality", ascending=False)
+        if not df["Live"].any():
+            st.warning("All markets look closed. These are setups from the last session, for practice only.")
+
+        fmt = {"Price": "{:,.3f}", "Stop-loss": "{:,.3f}", "Target": "{:,.3f}", "Shares": "{:,.0f}",
+               "Risk $": "{:,.0f}", "Reward $": "{:,.0f}", "Signal right %": "{:.0f}%",
+               "Activity ×": "{:.1f}×", "RSI": "{:.0f}", "$ traded / min": "{:,.0f}", "Quality": "{:.0f}",
+               "Bar time": lambda t: f"{t:%H:%M}"}
+        cols = ["Symbol", "Market", "Price", "Stop-loss", "Target", "Shares", "Risk $", "Reward $",
+                "Signal right %", "Tests", "Activity ×", "RSI", "$ traded / min", "Quality", "Bar time"]
+        for side, title, colr in (("BUY", "🟢 Top BUY setups", "#16a34a"), ("SELL", "🔴 Top SELL setups", "#dc2626")):
+            st.subheader(title)
+            part = good[good["Action"] == side].head(5)
+            if part.empty:
+                st.caption("Nothing passes your reliability filter right now. That's normal: no trade is a valid choice.")
+                continue
+            top = part.iloc[0]
+            st.markdown(f"<div style='border-left:4px solid {colr};padding:6px 12px;margin-bottom:8px'>"
+                        f"<b>#1 {top.Symbol}</b> · {side} about <b>{top.Shares:,}</b> at ~{top.Price:,.3f} · "
+                        f"stop {top['Stop-loss']:,.3f} · target {top.Target:,.3f} · "
+                        f"risk ${top['Risk $']:,.0f} to make ${top['Reward $']:,.0f} · "
+                        f"right {top['Signal right %']:.0f}% of {top.Tests} past tests</div>",
+                        unsafe_allow_html=True)
+            st.dataframe(part[cols].style.format(fmt, na_rep="–"), hide_index=True, width="stretch")
+        st.caption(f"Scanned {len(df)} stocks, {len(good)} passed your filters · updated {datetime.now():%H:%M:%S}")
+
+    ideas_view()
+    with st.expander("How these are picked (read before trading)"):
+        st.markdown("""
+- **Scanned:** your watchlist plus the 10 most traded, 10 biggest risers and 10 biggest fallers in each market
+  (priced over $1, over 200k shares traded today, so you can get in and out easily).
+- **BUY** = score of +2 or more (trend, momentum, VWAP, RSI agree upward). **SELL** = -2 or less.
+  SELL means sell shares you own, or short-sell if your broker allows it (short selling is riskier).
+- **Signal right %** = how often this exact rule called the direction correctly on this stock over the last 5 days.
+  The table hides anything below your minimum.
+- **Stop-loss** = 1.5 × the stock's normal 5-minute move away from the price. **Target** = twice that distance
+  (risk $1 to make $2). With a 2:1 target you can be right only 40% of the time and still roughly break even before fees.
+- **Shares** is sized so hitting the stop loses only your chosen risk %. Brokerage and currency fees are not included.
+- ASX/NZX prices are ~20 min delayed, so use these only for US stocks during live trading.
+- Practise on a paper (demo) account first. This is a technical screen, not financial advice.
+""")
 
 # ---------------------------------------------------------------- 1. Big movers
 with tab_movers:
@@ -277,24 +391,6 @@ with tab_watch:
         if remove and st.button("Remove"):
             save_watchlist([s for s in st.session_state.watchlist if s not in remove])
             st.rerun()
-
-
-# ---------------------------------------------------------------- 1-minute bars
-@st.cache_data(ttl=10, show_spinner=False)
-def bars_1m(symbol: str) -> pd.DataFrame:
-    """Last 5 trading days of 1-minute bars (Yahoo's limit for 1m data is ~7 days)."""
-    h = yf.Ticker(symbol).history(period="5d", interval="1m", prepost=False)
-    return h[["Open", "High", "Low", "Close", "Volume"]].dropna() if not h.empty else h
-
-
-def bars_many(symbols: tuple[str, ...]) -> dict:
-    def one(s):
-        try:
-            return s, bars_1m(s)
-        except Exception:
-            return s, pd.DataFrame()
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        return dict(pool.map(one, symbols))
 
 
 def live_chart(symbol: str, d: pd.DataFrame, proj_minutes: int):
