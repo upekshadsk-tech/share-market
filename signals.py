@@ -144,3 +144,50 @@ def trade_idea(symbol: str, df: pd.DataFrame, horizon: int, account: float, risk
         "Activity ×": s["Activity ×"], "RSI": s["RSI"], "$ traded / min": dollar_vol,
         "Quality": quality, "Bar time": s["Bar time"],
     }
+
+
+def live_signal(symbol: str, bars: pd.DataFrame, live_price: float | None, horizon: int = 5,
+                min_hit: float = 55, stop_atr: float = 1.5, reward_ratio: float = 2.0) -> dict:
+    """Re-score the stock using the newest live price on top of its 1-minute history."""
+    d = add_indicators(bars)
+    last = d.iloc[-1]
+    price = float(live_price) if live_price else float(last["Close"])
+
+    a9, a21 = 2 / 10, 2 / 22   # roll the EMAs forward to the live price
+    ema9 = last["EMA9"] + a9 * (price - last["EMA9"])
+    ema21 = last["EMA21"] + a21 * (price - last["EMA21"])
+    ref5 = d["Close"].iloc[-5] if len(d) >= 5 else d["Close"].iloc[0]
+    mom5 = (price / ref5 - 1) * 100
+    vwap = last["VWAP"]
+    rsi = last["RSI"]
+
+    score = int(np.sign(ema9 - ema21) + np.sign(mom5)
+                + (np.sign(price - vwap) if pd.notna(vwap) else 0)
+                + (1 if pd.notna(rsi) and rsi < 30 else -1 if pd.notna(rsi) and rsi > 70 else 0))
+    hr, n = hit_rate(d, horizon)
+    reliable = hr is not None and hr >= min_hit and n >= 50
+
+    if score >= 2 and reliable:
+        action = "BUY NOW"
+    elif score <= -2 and reliable:
+        action = "SELL NOW"
+    elif abs(score) >= 2:
+        action = "WAIT (unreliable)"
+    else:
+        action = "WAIT"
+
+    atr = atr_5m(bars)
+    stop = target = None
+    if atr and action in ("BUY NOW", "SELL NOW"):
+        r = stop_atr * atr
+        stop, target = (price - r, price + reward_ratio * r) if action == "BUY NOW" else (price + r, price - reward_ratio * r)
+
+    day = d[d.index.date == d.index[-1].date()]
+    prev = d[d.index.date < d.index[-1].date()]["Close"]
+    ref = prev.iloc[-1] if not prev.empty else day["Open"].iloc[0]
+    return {
+        "Symbol": symbol, "Action": action, "Price": price, "Day %": (price / ref - 1) * 100,
+        "Score": score, "Right %": hr, "Tests": n, "Last 5 min %": mom5,
+        "vs VWAP %": (price / vwap - 1) * 100 if pd.notna(vwap) and vwap else None,
+        "RSI": float(rsi) if pd.notna(rsi) else None, "Stop-loss": stop, "Target": target,
+    }

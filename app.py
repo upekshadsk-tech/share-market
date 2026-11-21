@@ -25,7 +25,8 @@ from yfinance import EquityQuery as Q
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from signals import add_indicators, summarise, trade_idea
+from signals import add_indicators, summarise, trade_idea, live_signal
+from live import LiveFeed
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
@@ -262,8 +263,8 @@ def status_view():
     st.caption("Live now: " + (", ".join(live) if live else "no market is open right now"))
 status_view()
 
-tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
-    ["🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
+tab_now, tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
+    ["⚡ Buy / Sell Now", "🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
 
 # ---------------------------------------------------------------- 1-minute bars
 @st.cache_data(ttl=10, show_spinner=False)
@@ -281,6 +282,123 @@ def bars_many(symbols: tuple[str, ...]) -> dict:
             return s, pd.DataFrame()
     with ThreadPoolExecutor(max_workers=10) as pool:
         return dict(pool.map(one, symbols))
+
+
+# ---------------------------------------------------------------- Buy / Sell now (my shares)
+@st.cache_resource
+def live_feed() -> LiveFeed:
+    return LiveFeed()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fallback_price(symbol: str):
+    try:
+        return float(yf.Ticker(symbol).fast_info.last_price)
+    except Exception:
+        return None
+
+
+NOW_CSS = """
+<style>
+.sig-card{border-radius:12px;padding:10px 14px;margin:6px 0;border:2px solid}
+.sig-buy{background:#dcfce7;border-color:#16a34a;color:#14532d}
+.sig-sell{background:#e0f2fe;border-color:#0284c7;color:#0c4a6e}
+.sig-wait{background:rgba(148,163,184,.12);border-color:rgba(148,163,184,.5)}
+.sig-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.sig-sym{font-size:1.25em;font-weight:800}
+.sig-act{font-weight:800;letter-spacing:.03em}
+.sig-price{font-size:1.2em;font-weight:700}
+.sig-sub{font-size:.85em;opacity:.9}
+.up{color:#15803d}.down{color:#b91c1c}
+</style>
+"""
+
+
+def signal_card(r: dict, tick: str, live: bool) -> str:
+    cls = {"BUY NOW": "sig-buy", "SELL NOW": "sig-sell"}.get(r["Action"], "sig-wait")
+    icon = {"BUY NOW": "🟢", "SELL NOW": "🔵"}.get(r["Action"], "⏸️")
+    dcls = "up" if (r["Day %"] or 0) >= 0 else "down"
+    plan = ""
+    if r["Stop-loss"] is not None:
+        plan = (f"<div class='sig-sub'><b>Stop-loss</b> {r['Stop-loss']:,.3f} · <b>Target</b> {r['Target']:,.3f}</div>")
+    right = f"{r['Right %']:.0f}% of {r['Tests']}" if r["Right %"] is not None else "–"
+    rsi = f"{r['RSI']:.0f}" if r["RSI"] is not None else "–"
+    return (f"<div class='sig-card {cls}'><div class='sig-top'>"
+            f"<span class='sig-sym'>{r['Symbol']}</span>"
+            f"<span class='sig-act'>{icon} {r['Action']}</span>"
+            f"<span class='sig-price'>{tick} {r['Price']:,.3f} <span class='{dcls}' style='font-size:.75em'>"
+            f"{r['Day %']:+.2f}%</span></span></div>"
+            f"<div class='sig-sub'>Score {r['Score']:+d} · signal right {right} · last 5 min {r['Last 5 min %']:+.2f}% · "
+            f"RSI {rsi} · {'⚡ live' if live else '1-min data'}</div>{plan}</div>")
+
+
+with tab_now:
+    st.markdown(NOW_CSS, unsafe_allow_html=True)
+    st.markdown("**Buy now / sell now for my selected shares**")
+    c1, c2, c3 = st.columns(3)
+    now_h = c1.selectbox("Signal for next", [1, 2, 5, 10, 15], index=2, format_func=lambda m: f"{m} min",
+                         key="now_h")
+    now_hit = c2.slider("Min. signal right %", 50, 70, 55, key="now_hit")
+    now_refresh = c3.selectbox("Refresh", [1, 2, 5], format_func=lambda s: f"every {s}s", key="now_ref")
+
+    @st.fragment(run_every=now_refresh)
+    def now_view():
+        wl = [s for s in st.session_state.watchlist if market_of(s) in chosen_markets]
+        if not wl:
+            st.info("Add companies to your watchlist first (➕ Pick Companies).")
+            return
+        feed = live_feed()
+        feed.watch(wl)
+        bars = bars_many(tuple(wl))
+        prev_px = st.session_state.setdefault("prev_px", {})
+        rows, live_flags = [], {}
+        for s in wl:
+            b = bars.get(s)
+            if b is None or b.empty or len(b) < 30:
+                continue
+            m = feed.get(s)
+            px = m["price"] if m else None
+            live_flags[s] = m is not None
+            try:
+                rows.append(live_signal(s, b, px, now_h, now_hit))
+            except Exception:
+                pass
+        if not rows:
+            st.info("No price data yet. The markets may be closed, or the data is still loading.")
+            return
+
+        def tick_for(r):
+            old, new = prev_px.get(r["Symbol"]), r["Price"]
+            prev_px[r["Symbol"]] = new
+            if old is None or old == new:
+                return "•"
+            return "<span class='up'>▲</span>" if new > old else "<span class='down'>▼</span>"
+
+        buys = sorted([r for r in rows if r["Action"] == "BUY NOW"], key=lambda r: -r["Score"])
+        sells = sorted([r for r in rows if r["Action"] == "SELL NOW"], key=lambda r: r["Score"])
+        waits = [r for r in rows if r["Action"].startswith("WAIT")]
+
+        cb, cs = st.columns(2)
+        with cb:
+            st.markdown(f"### 🟢 Good to BUY ({len(buys)})")
+            st.markdown("".join(signal_card(r, tick_for(r), live_flags.get(r["Symbol"])) for r in buys)
+                        or "<div class='sig-sub'>None right now</div>", unsafe_allow_html=True)
+        with cs:
+            st.markdown(f"### 🔵 Good to SELL ({len(sells)})")
+            st.markdown("".join(signal_card(r, tick_for(r), live_flags.get(r["Symbol"])) for r in sells)
+                        or "<div class='sig-sub'>None right now</div>", unsafe_allow_html=True)
+        with st.expander(f"⏸️ Wait / no clear signal ({len(waits)})", expanded=False):
+            st.markdown("".join(signal_card(r, tick_for(r), live_flags.get(r["Symbol"])) for r in waits),
+                        unsafe_allow_html=True)
+        n_live = sum(live_flags.values())
+        st.caption(f"{datetime.now():%H:%M:%S} · live stream: {'connected' if feed.connected else 'connecting…'} · "
+                   f"{n_live}/{len(wl)} stocks ticking live")
+
+    now_view()
+    st.caption("🟢 BUY NOW = score +2 or more and the signal has been right at least your minimum % on this stock "
+               "over the last 5 days. 🔵 SELL NOW = score -2 or less, same test. "
+               "'WAIT (unreliable)' = the signal points one way but hasn't been accurate enough for this stock. "
+               "Live ticks are near real-time for US stocks; ASX/NZX are ~20 min delayed. Not financial advice.")
 
 
 # ---------------------------------------------------------------- 0. Trade ideas
