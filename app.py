@@ -197,7 +197,7 @@ def market_clocks():
 with st.sidebar:
     st.header("Settings")
     chosen_markets = st.multiselect("Markets", list(MARKETS), default=list(MARKETS))
-    refresh = st.select_slider("Auto-refresh every", [10, 15, 30, 60, 120], value=30,
+    refresh = st.select_slider("Auto-refresh every", [10, 15, 30, 60, 120], value=10,
                                format_func=lambda s: f"{s}s")
     st.subheader("Big-mover filter")
     min_move = st.slider("Price move of at least (%)", 1.0, 30.0, 5.0, 0.5)
@@ -280,7 +280,7 @@ with tab_watch:
 
 
 # ---------------------------------------------------------------- 1-minute bars
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def bars_1m(symbol: str) -> pd.DataFrame:
     """Last 5 trading days of 1-minute bars (Yahoo's limit for 1m data is ~7 days)."""
     h = yf.Ticker(symbol).history(period="5d", interval="1m", prepost=False)
@@ -331,7 +331,7 @@ with tab_chart:
     else:
         c1, c2 = st.columns([3, 1])
         sym = c1.selectbox("Company", st.session_state.watchlist, key="chart_sym")
-        proj_min = c2.selectbox("Project ahead", [5, 10, 15], format_func=lambda m: f"{m} min")
+        proj_min = c2.selectbox("Project ahead", [1, 2, 5, 10, 15], index=2, format_func=lambda m: f"{m} min")
 
         @st.fragment(run_every=refresh)
         def chart_view():
@@ -361,9 +361,11 @@ with tab_chart:
 # ---------------------------------------------------------------- 4. Signals
 with tab_signals:
     st.markdown("**Which of my stocks look ready to move in the next few minutes?**")
-    horizon = st.radio("Look ahead", [5, 10, 15], horizontal=True, format_func=lambda m: f"{m} min")
+    horizon = st.radio("Look ahead", [1, 2, 5, 10, 15], index=2, horizontal=True,
+                       format_func=lambda m: f"{m} min",
+                       help="1-2 min signals are faster but closer to a coin flip; check Signal right %")
 
-    @st.fragment(run_every=max(refresh, 30))
+    @st.fragment(run_every=refresh)
     def signals_view():
         wl = tuple(s for s in st.session_state.watchlist if market_of(s) in chosen_markets)
         if not wl:
