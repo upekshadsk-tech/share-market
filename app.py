@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import exchange_calendars as xc
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -31,9 +32,10 @@ st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", la
 WATCHLIST_FILE = Path(__file__).with_name("watchlist.json")
 
 MARKETS = {
-    "USA": {"region": "us", "exchanges": ["NMS", "NYQ", "NGM", "NCM", "ASE"], "tz": "America/New_York"},
-    "Australia (ASX)": {"region": "au", "exchanges": ["ASX"], "tz": "Australia/Sydney"},
-    "New Zealand (NZX)": {"region": "nz", "exchanges": ["NZE"], "tz": "Pacific/Auckland"},
+    "USA": {"region": "us", "exchanges": ["NMS", "NYQ", "NGM", "NCM", "ASE"], "tz": "America/New_York",
+            "cal": "XNYS", "flag": "🇺🇸"},
+    "Australia (ASX)": {"region": "au", "exchanges": ["ASX"], "tz": "Australia/Sydney", "cal": "XASX", "flag": "🇦🇺"},
+    "New Zealand (NZX)": {"region": "nz", "exchanges": ["NZE"], "tz": "Pacific/Auckland", "cal": "XNZE", "flag": "🇳🇿"},
 }
 SUFFIX_MARKET = {".AX": "Australia (ASX)", ".NZ": "New Zealand (NZX)"}
 
@@ -187,15 +189,59 @@ def show_table(df: pd.DataFrame, alert_pct: float | None = None):
     st.dataframe(styler, hide_index=True, width="stretch")
 
 
-def market_clocks():
+@st.cache_resource
+def calendar(code: str):
+    return xc.get_calendar(code)
+
+
+def _until(delta: pd.Timedelta) -> str:
+    mins = int(delta.total_seconds() // 60)
+    d, h, m = mins // 1440, mins % 1440 // 60, mins % 60
+    return f"{d}d {h}h" if d else f"{h}h {m:02d}m" if h else f"{m} min"
+
+
+def market_status(name: str, my_tz: str) -> dict:
+    """Open/closed right now, using the exchange's real calendar (holidays and early closes)."""
+    cal = calendar(MARKETS[name]["cal"])
+    now = pd.Timestamp.now(tz="UTC").floor("min")
+    is_open = cal.is_open_on_minute(now)
+    nxt = cal.next_close(now) if is_open else cal.next_open(now)
+    local_next = nxt.tz_convert(my_tz)
+    return {"open": bool(is_open), "next": local_next, "in": nxt - now,
+            "exchange_time": now.tz_convert(MARKETS[name]["tz"])}
+
+
+def open_markets(my_tz: str) -> list[str]:
+    return [m for m in MARKETS if market_status(m, my_tz)["open"]]
+
+
+def market_status_bar(my_tz: str):
     cols = st.columns(len(MARKETS))
-    for col, (name, cfg) in zip(cols, MARKETS.items()):
-        col.caption(f"**{name}** · {datetime.now(ZoneInfo(cfg['tz'])):%a %H:%M}")
+    for col, name in zip(cols, MARKETS):
+        try:
+            ms = market_status(name, my_tz)
+        except Exception:
+            col.caption(f"{name}: status unavailable")
+            continue
+        if ms["open"]:
+            badge, colr, line = "🟢 OPEN NOW", "#16a34a", f"closes in {_until(ms['in'])} ({ms['next']:%H:%M} your time)"
+        else:
+            badge, colr, line = "🔴 CLOSED", "#dc2626", f"opens in {_until(ms['in'])} ({ms['next']:%a %H:%M} your time)"
+        col.markdown(
+            f"<div style='border:1px solid {colr};border-radius:10px;padding:8px 10px'>"
+            f"<div style='font-weight:600'>{MARKETS[name]['flag']} {name}</div>"
+            f"<div style='color:{colr};font-weight:700'>{badge}</div>"
+            f"<div style='font-size:.85em'>{line}</div>"
+            f"<div style='font-size:.75em;opacity:.7'>Exchange time {ms['exchange_time']:%a %H:%M}</div></div>",
+            unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- sidebar settings
 with st.sidebar:
     st.header("Settings")
+    my_tz = st.selectbox("My time zone", ["Pacific/Auckland", "Australia/Sydney", "Australia/Perth",
+                                          "America/New_York", "Asia/Colombo", "UTC"])
+    only_open = st.toggle("Trade Ideas: scan only markets open now", value=True)
     chosen_markets = st.multiselect("Markets", list(MARKETS), default=list(MARKETS))
     refresh = st.select_slider("Auto-refresh every", [10, 15, 30, 60, 120], value=10,
                                format_func=lambda s: f"{s}s")
@@ -208,7 +254,13 @@ with st.sidebar:
     st.caption("US prices are near real-time. ASX and NZX are delayed about 20 minutes.")
 
 st.title("📈 Stock Tracker: USA · Australia · New Zealand")
-market_clocks()
+
+@st.fragment(run_every=30)
+def status_view():
+    market_status_bar(my_tz)
+    live = open_markets(my_tz)
+    st.caption("Live now: " + (", ".join(live) if live else "no market is open right now"))
+status_view()
 
 tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
     ["🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
@@ -260,8 +312,16 @@ with tab_ideas:
 
     @st.fragment(run_every=max(refresh, 30))
     def ideas_view():
-        universe = scan_universe(tuple(chosen_markets),
-                                 tuple(s for s in st.session_state.watchlist if market_of(s) in chosen_markets))
+        scan_mkts = chosen_markets
+        if only_open:
+            live = [m for m in chosen_markets if m in open_markets(my_tz)]
+            if live:
+                scan_mkts = live
+                st.caption("Scanning markets open now: " + ", ".join(live))
+            else:
+                st.caption("No chosen market is open, so showing the last session's setups for practice.")
+        universe = scan_universe(tuple(scan_mkts),
+                                 tuple(s for s in st.session_state.watchlist if market_of(s) in scan_mkts))
         if not universe:
             st.info("Pick at least one market in Settings.")
             return
