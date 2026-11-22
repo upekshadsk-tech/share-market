@@ -352,7 +352,10 @@ with tab_now:
             st.query_params["ntfy"] = ntfy_topic
         if ntfy_topic and st.button("Send test alert"):
             ok = send_push(ntfy_topic, "✅ Stock Tracker test", "Alerts are working.", "info")
-            st.success("Sent. Check your phone.") if ok else st.error("Couldn't send. Check the topic name.")
+            if ok:
+                st.success(f"Sent to topic '{ntfy_topic}'. Check your phone.")
+            else:
+                st.error("Couldn't send. Check the topic name.")
 
     @st.fragment(run_every=now_refresh)
     def now_view():
