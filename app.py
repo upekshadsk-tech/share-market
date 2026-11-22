@@ -27,6 +27,7 @@ from plotly.subplots import make_subplots
 
 from signals import add_indicators, summarise, trade_idea, live_signal
 from live import LiveFeed
+from notify import alert_text, send_push
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
@@ -340,6 +341,18 @@ with tab_now:
                          key="now_h")
     now_hit = c2.slider("Min. signal right %", 50, 70, 55, key="now_hit")
     now_refresh = c3.selectbox("Refresh", [1, 2, 5], format_func=lambda s: f"every {s}s", key="now_ref")
+    with st.expander("📲 Phone alerts", expanded=False):
+        st.caption("Install the free **ntfy** app (Play Store), tap **+**, and subscribe to a private topic name "
+                   "only you know, e.g. `upeksha-stocks-7391`. Enter the same name here. "
+                   "These alerts work while this app is open; the GitHub checker covers when it is closed.")
+        default_topic = st.query_params.get("ntfy", "")
+        ntfy_topic = st.text_input("ntfy topic", value=default_topic, key="ntfy_topic").strip()
+        alerts_on = st.toggle("Send BUY / SELL alerts to my phone", value=bool(ntfy_topic), key="alerts_on")
+        if ntfy_topic:
+            st.query_params["ntfy"] = ntfy_topic
+        if ntfy_topic and st.button("Send test alert"):
+            ok = send_push(ntfy_topic, "✅ Stock Tracker test", "Alerts are working.", "info")
+            st.success("Sent. Check your phone.") if ok else st.error("Couldn't send. Check the topic name.")
 
     @st.fragment(run_every=now_refresh)
     def now_view():
@@ -373,6 +386,17 @@ with tab_now:
             if old is None or old == new:
                 return "•"
             return "<span class='up'>▲</span>" if new > old else "<span class='down'>▼</span>"
+
+        # Phone alert when a share CHANGES into BUY NOW or SELL NOW
+        sent = st.session_state.setdefault("alert_state", {})
+        if st.session_state.get("alerts_on") and st.session_state.get("ntfy_topic"):
+            for r in rows:
+                act = r["Action"]
+                if act in ("BUY NOW", "SELL NOW") and sent.get(r["Symbol"]) != act:
+                    title, body = alert_text(r)
+                    send_push(st.session_state["ntfy_topic"], title, body, act)
+                    st.toast(title)
+                sent[r["Symbol"]] = act
 
         buys = sorted([r for r in rows if r["Action"] == "BUY NOW"], key=lambda r: -r["Score"])
         sells = sorted([r for r in rows if r["Action"] == "SELL NOW"], key=lambda r: r["Score"])

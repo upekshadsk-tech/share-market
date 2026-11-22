@@ -1,0 +1,28 @@
+name: Stock alerts
+
+on:
+  schedule:
+    - cron: "0 * * * 1-5"   # every hour, Mon-Fri (UTC). The script exits fast if no market is open.
+  workflow_dispatch:        # lets you start it by hand from the Actions tab
+
+concurrency:
+  group: stock-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 62
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python alerts.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          APP_URL: ${{ vars.APP_URL }}
+          HORIZON: ${{ vars.HORIZON }}
+          MIN_HIT: ${{ vars.MIN_HIT }}

@@ -1,0 +1,7 @@
+# Shares to send phone alerts for (one per line). Edit this file on GitHub any time.
+# US: AAPL   Australia: BHP.AX   New Zealand: AIR.NZ
+AAPL
+NVDA
+TSLA
+AMD
+MSFT
