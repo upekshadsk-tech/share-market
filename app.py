@@ -41,7 +41,22 @@ try:
             _os.environ[_k] = str(st.secrets[_k])
 except Exception:
     pass
-import tiger_data  # noqa: E402  (read-only prices, never trades)
+try:
+    import tiger_data  # noqa: E402  (optional: read-only Tiger prices, never trades)
+except Exception:      # tiger_data.py not uploaded: run on Yahoo prices only
+    class _NoTiger:
+        @staticmethod
+        def configured():
+            return False
+
+        @staticmethod
+        def prices(symbols):
+            return {}
+
+        @staticmethod
+        def status():
+            return {"ok": False, "message": "tiger_data.py not uploaded"}
+    tiger_data = _NoTiger()
 
 WATCHLIST_FILE = Path(__file__).with_name("watchlist.json")
 
