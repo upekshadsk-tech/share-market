@@ -25,7 +25,8 @@ def alert_text(r: dict) -> tuple[str, str]:
     title = f"{icon} {r['Action']}: {r['Symbol']} @ {r['Price']:,.3f}"
     lines = [f"Day {r['Day %']:+.2f}% · score {r['Score']:+d}"]
     if r.get("Right %") is not None:
-        lines.append(f"Signal right {r['Right %']:.0f}% of {r['Tests']} past tests")
+        days = f" over {r['History days']} days" if r.get("History days") else ""
+        lines.append(f"Signal right {r['Right %']:.0f}% of {r['Tests']} past tests{days}")
     if r.get("Stop-loss") is not None:
         lines.append(f"Stop {r['Stop-loss']:,.3f} · Target {r['Target']:,.3f}")
     lines.append("Not financial advice. Check the chart first.")

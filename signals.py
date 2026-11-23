@@ -4,11 +4,62 @@ Short-term momentum signals built from 1-minute price bars.
 These are NOT guarantees. They summarise what the price is doing right now
 (trend, momentum, position vs VWAP, volume surge) into a score, and they
 measure how often that score has called the next few minutes correctly
-over recent days, so you can judge whether to trust it for each stock.
+over the last ~10 trading days (never fewer than 5), so you can judge whether to trust it
+for each stock.
 """
+
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+
+MIN_HISTORY_DAYS = 5      # never give a signal unless at least this many past trading days were tested
+HISTORY_CALENDAR_DAYS = 14  # how far back to load 1-minute data (about 10 trading days)
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def fetch_history_1m(symbol: str, days: int = HISTORY_CALENDAR_DAYS) -> pd.DataFrame:
+    """About two weeks of 1-minute bars. Yahoo allows max ~7 days per request, so fetch in chunks."""
+    import yfinance as yf
+    now = datetime.now(timezone.utc)
+    frames, end = [], now + timedelta(minutes=1)
+    while end > now - timedelta(days=days):
+        start = max(end - timedelta(days=7), now - timedelta(days=days))
+        try:
+            h = yf.Ticker(symbol).history(start=start, end=end, interval="1m", prepost=False)
+            if not h.empty:
+                frames.append(h[OHLCV])
+        except Exception:
+            pass
+        end = start
+    if not frames:
+        return pd.DataFrame(columns=OHLCV)
+    df = pd.concat(frames)
+    return df[~df.index.duplicated(keep="last")].sort_index().dropna()
+
+
+def fetch_today_1m(symbol: str) -> pd.DataFrame:
+    import yfinance as yf
+    h = yf.Ticker(symbol).history(period="1d", interval="1m", prepost=False)
+    return h[OHLCV].dropna() if not h.empty else pd.DataFrame(columns=OHLCV)
+
+
+def combine_bars(history: pd.DataFrame, today: pd.DataFrame) -> pd.DataFrame:
+    """Old history (cached) + the freshest bars of today."""
+    if today is None or today.empty:
+        return history
+    if history is None or history.empty:
+        return today
+    df = pd.concat([history[history.index < today.index[0]], today])
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
+def history_days(bars: pd.DataFrame) -> int:
+    """Number of complete past trading days in the data (today's session not counted)."""
+    if bars is None or bars.empty:
+        return 0
+    dates = pd.Index(bars.index.date).unique()
+    return int(sum(d < bars.index[-1].date() for d in dates))
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -78,7 +129,10 @@ def summarise(symbol: str, df: pd.DataFrame, horizon: int = 5) -> dict:
     score = int(last["Score"]) if pd.notna(last["Score"]) else 0
     hr, n = hit_rate(d, horizon)
     proj = projection(d, horizon)
-    if score >= 2:
+    days = history_days(df)
+    if days < MIN_HISTORY_DAYS:
+        call = f"– Not enough history ({days}d)"
+    elif score >= 2:
         call = "▲ Up bias"
     elif score <= -2:
         call = "▼ Down bias"
@@ -98,8 +152,9 @@ def summarise(symbol: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         "RSI": float(last["RSI"]) if pd.notna(last["RSI"]) else None,
         "Volume surge ×": float(last["VolSurge"]) if pd.notna(last["VolSurge"]) else None,
         "Activity ×": float(activity) if pd.notna(activity) else None,
-        "Signal right % (5d)": hr,
+        "Signal right %": hr,
         "Tests": n,
+        "History days": days,
         "Bar time": d.index[-1],
     }
 
@@ -118,7 +173,7 @@ def trade_idea(symbol: str, df: pd.DataFrame, horizon: int, account: float, risk
                stop_atr: float = 1.5, reward_ratio: float = 2.0) -> dict | None:
     """Turn the current signal into a concrete plan: entry, stop-loss, target, size."""
     s = summarise(symbol, df, horizon)
-    if s["Score"] == 0:
+    if s["Score"] == 0 or s["History days"] < MIN_HISTORY_DAYS:
         return None
     atr = atr_5m(df)
     if not atr:
@@ -132,7 +187,7 @@ def trade_idea(symbol: str, df: pd.DataFrame, horizon: int, account: float, risk
         stop, target = price + risk_per_share, price - reward_ratio * risk_per_share
     shares = int((account * risk_pct / 100) // risk_per_share) if risk_per_share > 0 else 0
     shares = min(shares, int(account // price))  # never more than the account can pay for
-    hr = s["Signal right % (5d)"] or 0
+    hr = s["Signal right %"] or 0
     dollar_vol = float((df["Close"] * df["Volume"]).tail(30).mean())
     # Quality: edge over a coin flip x signal strength x how active the stock is right now
     quality = max(hr - 50, 0) * abs(s["Score"]) * min(max(s["Activity ×"] or 1, 0.5), 3)
@@ -140,7 +195,8 @@ def trade_idea(symbol: str, df: pd.DataFrame, horizon: int, account: float, risk
         "Symbol": symbol, "Action": side, "Price": price,
         "Stop-loss": stop, "Target": target,
         "Shares": shares, "Risk $": shares * risk_per_share, "Reward $": shares * reward_ratio * risk_per_share,
-        "Score": s["Score"], "Signal right %": s["Signal right % (5d)"], "Tests": s["Tests"],
+        "Score": s["Score"], "Signal right %": s["Signal right %"], "Tests": s["Tests"],
+        "History days": s["History days"],
         "Activity ×": s["Activity ×"], "RSI": s["RSI"], "$ traded / min": dollar_vol,
         "Quality": quality, "Bar time": s["Bar time"],
     }
@@ -165,9 +221,12 @@ def live_signal(symbol: str, bars: pd.DataFrame, live_price: float | None, horiz
                 + (np.sign(price - vwap) if pd.notna(vwap) else 0)
                 + (1 if pd.notna(rsi) and rsi < 30 else -1 if pd.notna(rsi) and rsi > 70 else 0))
     hr, n = hit_rate(d, horizon)
-    reliable = hr is not None and hr >= min_hit and n >= 50
+    days = history_days(bars)
+    reliable = hr is not None and hr >= min_hit and n >= 50 and days >= MIN_HISTORY_DAYS
 
-    if score >= 2 and reliable:
+    if days < MIN_HISTORY_DAYS:
+        action = "WAIT (not enough history)"
+    elif score >= 2 and reliable:
         action = "BUY NOW"
     elif score <= -2 and reliable:
         action = "SELL NOW"
@@ -187,7 +246,59 @@ def live_signal(symbol: str, bars: pd.DataFrame, live_price: float | None, horiz
     ref = prev.iloc[-1] if not prev.empty else day["Open"].iloc[0]
     return {
         "Symbol": symbol, "Action": action, "Price": price, "Day %": (price / ref - 1) * 100,
-        "Score": score, "Right %": hr, "Tests": n, "Last 5 min %": mom5,
+        "Score": score, "Right %": hr, "Tests": n, "History days": days, "Last 5 min %": mom5,
         "vs VWAP %": (price / vwap - 1) * 100 if pd.notna(vwap) and vwap else None,
         "RSI": float(rsi) if pd.notna(rsi) else None, "Stop-loss": stop, "Target": target,
     }
+
+
+EVAL_HORIZONS = (5, 10, 15)
+
+
+def evaluate_signal(bars: pd.DataFrame, t, action: str, price: float, stop=None, target=None,
+                    max_minutes: int = 60) -> dict:
+    """Check a past BUY/SELL signal against what the price actually did afterwards."""
+    t = pd.Timestamp(t)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    direction = 1 if action == "BUY NOW" else -1
+    after = bars[bars.index > t]
+    after = after[after.index <= t + pd.Timedelta(minutes=max_minutes)]
+    out = {}
+    for h in EVAL_HORIZONS:
+        at = after[after.index >= t + pd.Timedelta(minutes=h)]
+        if at.empty:
+            out[f"Price +{h}m"] = None
+            out[f"+{h}m %"] = None
+        else:
+            p = float(at["Close"].iloc[0])
+            out[f"Price +{h}m"] = p
+            out[f"+{h}m %"] = (p / price - 1) * 100 * direction   # positive = signal was right
+    result, minutes = "⏳ Waiting", None
+    if not after.empty:
+        for ts, row in after.iterrows():
+            hit_stop = stop is not None and pd.notna(stop) and (
+                row["Low"] <= stop if direction == 1 else row["High"] >= stop)
+            hit_target = target is not None and pd.notna(target) and (
+                row["High"] >= target if direction == 1 else row["Low"] <= target)
+            if hit_stop:  # if both happen in the same minute, assume the worse case
+                result, minutes = "❌ Stop hit", (ts - t).total_seconds() / 60
+                break
+            if hit_target:
+                result, minutes = "✅ Target hit", (ts - t).total_seconds() / 60
+                break
+        else:
+            span = (after.index[-1] - t).total_seconds() / 60
+            if span >= max_minutes - 1 or after.index[-1].date() != t.tz_convert(after.index.tz).date():
+                last = float(after["Close"].iloc[-1])
+                pl = (last / price - 1) * 100 * direction
+                result = f"➖ Neither ({pl:+.2f}%)"
+        moves = (after["High"] / price - 1) * 100 * direction, (after["Low"] / price - 1) * 100 * direction
+        best = max(moves[0].max(), moves[1].max())
+        worst = min(moves[0].min(), moves[1].min())
+        out["Best %"], out["Worst %"] = float(best), float(worst)
+    else:
+        out["Best %"] = out["Worst %"] = None
+    out["Result"] = result
+    out["Minutes"] = minutes
+    return out

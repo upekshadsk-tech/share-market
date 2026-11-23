@@ -25,9 +25,11 @@ from yfinance import EquityQuery as Q
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from signals import add_indicators, summarise, trade_idea, live_signal
+from signals import (EVAL_HORIZONS, MIN_HISTORY_DAYS, add_indicators, combine_bars, evaluate_signal,
+                     fetch_history_1m, fetch_today_1m, live_signal, summarise, trade_idea)
 from live import LiveFeed
 from notify import alert_text, send_push
+from scanner import market_candidates
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
@@ -264,15 +266,24 @@ def status_view():
     st.caption("Live now: " + (", ".join(live) if live else "no market is open right now"))
 status_view()
 
-tab_now, tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
-    ["⚡ Buy / Sell Now", "🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
+tab_now, tab_log, tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
+    ["⚡ Buy / Sell Now", "📒 Signal Log", "🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
 
 # ---------------------------------------------------------------- 1-minute bars
+@st.cache_data(ttl=1800, show_spinner=False)
+def bars_history(symbol: str) -> pd.DataFrame:
+    """~2 weeks of 1-minute bars (about 10 trading days). Reloaded every 30 minutes."""
+    return fetch_history_1m(symbol)
+
+
 @st.cache_data(ttl=10, show_spinner=False)
+def bars_today(symbol: str) -> pd.DataFrame:
+    return fetch_today_1m(symbol)
+
+
 def bars_1m(symbol: str) -> pd.DataFrame:
-    """Last 5 trading days of 1-minute bars (Yahoo's limit for 1m data is ~7 days)."""
-    h = yf.Ticker(symbol).history(period="5d", interval="1m", prepost=False)
-    return h[["Open", "High", "Low", "Close", "Volume"]].dropna() if not h.empty else h
+    """History + today's freshest bars. Signals need at least 5 full past trading days."""
+    return combine_bars(bars_history(symbol), bars_today(symbol))
 
 
 def bars_many(symbols: tuple[str, ...]) -> dict:
@@ -322,7 +333,8 @@ def signal_card(r: dict, tick: str, live: bool) -> str:
     plan = ""
     if r["Stop-loss"] is not None:
         plan = (f"<div class='sig-sub'><b>Stop-loss</b> {r['Stop-loss']:,.3f} · <b>Target</b> {r['Target']:,.3f}</div>")
-    right = f"{r['Right %']:.0f}% of {r['Tests']}" if r["Right %"] is not None else "–"
+    right = (f"{r['Right %']:.0f}% of {r['Tests']} ({r['History days']}d)"
+             if r["Right %"] is not None else "–")
     rsi = f"{r['RSI']:.0f}" if r["RSI"] is not None else "–"
     return (f"<div class='sig-card {cls}'><div class='sig-top'>"
             f"<span class='sig-sym'>{r['Symbol']}</span>"
@@ -391,15 +403,22 @@ with tab_now:
             return "<span class='up'>▲</span>" if new > old else "<span class='down'>▼</span>"
 
         # Phone alert when a share CHANGES into BUY NOW or SELL NOW
+        # and record every new signal in the Signal Log
         sent = st.session_state.setdefault("alert_state", {})
-        if st.session_state.get("alerts_on") and st.session_state.get("ntfy_topic"):
-            for r in rows:
-                act = r["Action"]
-                if act in ("BUY NOW", "SELL NOW") and sent.get(r["Symbol"]) != act:
+        app_log = st.session_state.setdefault("app_log", [])
+        push_on = st.session_state.get("alerts_on") and st.session_state.get("ntfy_topic")
+        for r in rows:
+            act = r["Action"]
+            if act in ("BUY NOW", "SELL NOW") and sent.get(r["Symbol"]) != act:
+                app_log.append({"Time (UTC)": pd.Timestamp.now(tz="UTC").floor("s"), "Symbol": r["Symbol"],
+                                "Action": act, "Price": r["Price"], "Stop-loss": r["Stop-loss"],
+                                "Target": r["Target"], "Score": r["Score"], "Right %": r["Right %"],
+                                "Horizon": now_h, "Source": "app"})
+                if push_on:
                     title, body = alert_text(r)
                     send_push(st.session_state["ntfy_topic"], title, body, act)
                     st.toast(title)
-                sent[r["Symbol"]] = act
+            sent[r["Symbol"]] = act
 
         buys = sorted([r for r in rows if r["Action"] == "BUY NOW"], key=lambda r: -r["Score"])
         sells = sorted([r for r in rows if r["Action"] == "SELL NOW"], key=lambda r: r["Score"])
@@ -423,24 +442,128 @@ with tab_now:
 
     now_view()
     st.caption("🟢 BUY NOW = score +2 or more and the signal has been right at least your minimum % on this stock "
-               "over the last 5 days. 🔵 SELL NOW = score -2 or less, same test. "
+               f"over at least {MIN_HISTORY_DAYS} past trading days (usually ~10). 🔵 SELL NOW = score -2 or less, same test. "
                "'WAIT (unreliable)' = the signal points one way but hasn't been accurate enough for this stock. "
                "Live ticks are near real-time for US stocks; ASX/NZX are ~20 min delayed. Not financial advice.")
+
+
+# ---------------------------------------------------------------- Signal log
+DEFAULT_LOG_URL = "https://raw.githubusercontent.com/upekshadsk-tech/share-market/signal-log/signal_log.csv"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_github_log(url: str) -> pd.DataFrame:
+    import io
+    import requests
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200:
+        return pd.DataFrame()
+    return pd.read_csv(io.StringIO(r.text))
+
+
+def bars_7d(symbol: str) -> pd.DataFrame:
+    return bars_1m(symbol)
+
+
+with tab_log:
+    st.markdown("**Were the signals right?** Every BUY/SELL signal with its time and price, "
+                "checked against what the price did next.")
+    c1, c2 = st.columns([3, 1])
+    log_url = c1.text_input("GitHub signal log (from the alert checker)", DEFAULT_LOG_URL)
+    days = c2.selectbox("Show last", [1, 3, 7, 30, 365], index=2, format_func=lambda d: f"{d} days")
+    sources = st.multiselect("Signals from", ["github", "scan", "app"], default=["github", "scan", "app"],
+                             help="github = your alert shares; scan = whole-market buy suggestions (both saved permanently); "
+                                  "app = signals seen while this app was open (cleared when the app restarts)")
+
+    frames = []
+    if "github" in sources or "scan" in sources:
+        try:
+            g = load_github_log(log_url)
+            if not g.empty:
+                frames.append(g[g["Source"].isin([x for x in sources if x != "app"])] if "Source" in g else g)
+        except Exception as e:
+            st.caption(f"Couldn't load the GitHub log yet ({e}).")
+    if "app" in sources and st.session_state.get("app_log"):
+        frames.append(pd.DataFrame(st.session_state["app_log"]))
+
+    if not frames:
+        st.info("No signals logged yet. They appear here as soon as a share turns BUY NOW or SELL NOW "
+                "(GitHub checker during market hours, or this app while it's open).")
+    else:
+        log = pd.concat(frames, ignore_index=True)
+        log["Time (UTC)"] = pd.to_datetime(log["Time (UTC)"], utc=True)
+        log = log[log["Time (UTC)"] >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)]
+        log = log.sort_values("Time (UTC)", ascending=False).reset_index(drop=True)
+
+        # Fill in results that are not saved yet (fresh signals, or app signals)
+        need = log["Result"].isna() | log["Result"].astype(str).str.startswith("⏳") if "Result" in log else \
+            pd.Series(True, index=log.index)
+        for i in log[need].index:
+            row = log.loc[i]
+            try:
+                ev = evaluate_signal(bars_7d(row["Symbol"]), row["Time (UTC)"], row["Action"], float(row["Price"]),
+                                     row.get("Stop-loss"), row.get("Target"))
+                for k, v in ev.items():
+                    log.at[i, k] = v
+            except Exception:
+                pass
+
+        h = st.radio("Judge signals after", list(EVAL_HORIZONS), index=0, horizontal=True,
+                     format_func=lambda m: f"{m} min")
+        col = f"+{h}m %"
+        done = log[pd.to_numeric(log.get(col), errors="coerce").notna()]
+        n = len(done)
+        right = int((pd.to_numeric(done[col]) > 0).sum()) if n else 0
+        res = log["Result"].astype(str) if "Result" in log else pd.Series(dtype=str)
+        tgt, stp = int(res.str.startswith("✅").sum()), int(res.str.startswith("❌").sum())
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Signals", len(log))
+        m2.metric(f"Right after {h} min", f"{right / n * 100:.0f}%" if n else "–", f"{right} of {n}")
+        m3.metric("Target hit first", f"{tgt / (tgt + stp) * 100:.0f}%" if tgt + stp else "–", f"{tgt} vs {stp} stops")
+        m4.metric(f"Avg move after {h} min", f"{pd.to_numeric(done[col]).mean():+.2f}%" if n else "–",
+                  help="In the signal's direction, before fees. Positive = the signal made money on average.")
+
+        show = log.copy()
+        show.insert(0, "Time", show["Time (UTC)"].dt.tz_convert(my_tz).dt.strftime("%a %d %b %H:%M:%S"))
+        cols = ["Time", "Symbol", "Action", "Price", "Stop-loss", "Target"] + \
+               [c for h_ in EVAL_HORIZONS for c in (f"Price +{h_}m", f"+{h_}m %")] + \
+               ["Result", "Minutes", "Best %", "Worst %", "Right %", "Source"]
+        show = show[[c for c in cols if c in show.columns]]
+        num = {c: "{:,.3f}" for c in ["Price", "Stop-loss", "Target"] + [f"Price +{x}m" for x in EVAL_HORIZONS]}
+        num.update({c: "{:+.2f}%" for c in [f"+{x}m %" for x in EVAL_HORIZONS] + ["Best %", "Worst %"]})
+        num.update({"Minutes": "{:.0f}", "Right %": "{:.0f}%"})
+
+        def row_color(r):
+            c = "background-color:#dcfce7" if r["Action"] == "BUY NOW" else "background-color:#e0f2fe"
+            return [c if k in ("Time", "Symbol", "Action") else "" for k in r.index]
+
+        def pct_color(v):
+            try:
+                return "color:#15803d;font-weight:600" if float(v) > 0 else "color:#b91c1c;font-weight:600" if float(v) < 0 else ""
+            except (TypeError, ValueError):
+                return ""
+
+        pct_cols = [c for c in show.columns if c.endswith("m %")]
+        st.dataframe(show.style.format(num, na_rep="–").apply(row_color, axis=1).map(pct_color, subset=pct_cols),
+                     hide_index=True, width="stretch")
+        st.download_button("⬇️ Download log (CSV)", show.to_csv(index=False).encode(), "signal_log.csv", "text/csv")
+        st.caption(f"Times in {my_tz}. '+5m %' is the move in the signal's direction (green = the signal was right). "
+                   "'Result' checks the first hour: did the price reach the target or the stop-loss first? "
+                   "Fees are not included. Results appear once enough minutes have passed.")
 
 
 # ---------------------------------------------------------------- 0. Trade ideas
 @st.cache_data(ttl=120, show_spinner=False)
 def scan_universe(markets: tuple[str, ...], watchlist: tuple[str, ...]) -> list[str]:
-    """Watchlist + today's most active and biggest-moving stocks in each chosen market."""
+    """Watchlist + the best BUY and SELL candidates from a scan of EVERY share in each market."""
     syms = list(watchlist)
     for m in markets:
-        try:
-            base = [_base_query(m), Q("gt", ["intradayprice", 1]), Q("gt", ["dayvolume", 200_000])]
-            for sort_field, asc in (("dayvolume", False), ("percentchange", False), ("percentchange", True)):
-                syms += [r["symbol"] for r in _screen_rows(Q("and", base), sort_field, asc, size=10)]
-        except Exception:
-            pass
-    return list(dict.fromkeys(syms))[:45]
+        for side in ("buy", "sell"):
+            try:
+                syms += market_candidates(m, side, 15)["Symbol"].tolist()
+            except Exception:
+                pass
+    return list(dict.fromkeys(syms))[:100]
 
 
 with tab_ideas:
@@ -497,9 +620,10 @@ with tab_ideas:
         fmt = {"Price": "{:,.3f}", "Stop-loss": "{:,.3f}", "Target": "{:,.3f}", "Shares": "{:,.0f}",
                "Risk $": "{:,.0f}", "Reward $": "{:,.0f}", "Signal right %": "{:.0f}%",
                "Activity ×": "{:.1f}×", "RSI": "{:.0f}", "$ traded / min": "{:,.0f}", "Quality": "{:.0f}",
+               "History days": "{:.0f}",
                "Bar time": lambda t: f"{t:%H:%M}"}
         cols = ["Symbol", "Market", "Price", "Stop-loss", "Target", "Shares", "Risk $", "Reward $",
-                "Signal right %", "Tests", "Activity ×", "RSI", "$ traded / min", "Quality", "Bar time"]
+                "Signal right %", "Tests", "History days", "Activity ×", "RSI", "$ traded / min", "Quality", "Bar time"]
         for side, title, colr in (("BUY", "🟢 Top BUY setups", "#16a34a"), ("SELL", "🔴 Top SELL setups", "#dc2626")):
             st.subheader(title)
             part = good[good["Action"] == side].head(5)
@@ -511,7 +635,7 @@ with tab_ideas:
                         f"<b>#1 {top.Symbol}</b> · {side} about <b>{top.Shares:,}</b> at ~{top.Price:,.3f} · "
                         f"stop {top['Stop-loss']:,.3f} · target {top.Target:,.3f} · "
                         f"risk ${top['Risk $']:,.0f} to make ${top['Reward $']:,.0f} · "
-                        f"right {top['Signal right %']:.0f}% of {top.Tests} past tests</div>",
+                        f"right {top['Signal right %']:.0f}% of {top.Tests} past tests over {top['History days']} days</div>",
                         unsafe_allow_html=True)
             st.dataframe(part[cols].style.format(fmt, na_rep="–"), hide_index=True, width="stretch")
         st.caption(f"Scanned {len(df)} stocks, {len(good)} passed your filters · updated {datetime.now():%H:%M:%S}")
@@ -519,11 +643,13 @@ with tab_ideas:
     ideas_view()
     with st.expander("How these are picked (read before trading)"):
         st.markdown("""
-- **Scanned:** your watchlist plus the 10 most traded, 10 biggest risers and 10 biggest fallers in each market
-  (priced over $1, over 200k shares traded today, so you can get in and out easily).
+- **Scanned:** every listed share in each open market is screened first. The app keeps liquid shares
+  moving on unusual volume (at least 1.2× normal for the time of day), near the day's high (for buys)
+  or low (for sells), then runs the full signal check on the best 15 each way, plus your watchlist.
 - **BUY** = score of +2 or more (trend, momentum, VWAP, RSI agree upward). **SELL** = -2 or less.
   SELL means sell shares you own, or short-sell if your broker allows it (short selling is riskier).
-- **Signal right %** = how often this exact rule called the direction correctly on this stock over the last 5 days.
+- **Signal right %** = how often this exact rule called the direction correctly on this stock over the last
+  ~10 trading days (**History days**, minimum 5; shares with less history are skipped).
   The table hides anything below your minimum.
 - **Stop-loss** = 1.5 × the stock's normal 5-minute move away from the price. **Target** = twice that distance
   (risk $1 to make $2). With a 2:1 target you can be right only 40% of the time and still roughly break even before fees.
@@ -692,14 +818,14 @@ with tab_signals:
 
         fmt = {"Price": "{:,.3f}", f"Next {horizon} min (trend)": "{:,.3f}", "Range low": "{:,.3f}",
                "Range high": "{:,.3f}", "Last 5 min %": "{:+.2f}%", "RSI": "{:.0f}",
-               "Volume surge ×": "{:.1f}×", "Activity ×": "{:.1f}×", "Signal right % (5d)": "{:.0f}%",
+               "Volume surge ×": "{:.1f}×", "Activity ×": "{:.1f}×", "Signal right %": "{:.0f}%", "History days": "{:.0f}",
                "Bar time": lambda t: f"{t:%H:%M}"}
         sig_color = lambda v: ("color:#16a34a;font-weight:600" if "Up" in str(v)
                                else "color:#dc2626;font-weight:600" if "Down" in str(v) else "")
         trust = lambda v: ("" if pd.isna(v) else "background-color:rgba(22,163,74,.18)" if v >= 55
                            else "background-color:rgba(220,38,38,.15)" if v < 50 else "")
         st.dataframe(df.style.format(fmt, na_rep="–").map(sig_color, subset=["Signal"])
-                     .map(trust, subset=["Signal right % (5d)"]), hide_index=True, width="stretch")
+                     .map(trust, subset=["Signal right %"]), hide_index=True, width="stretch")
         st.caption(f"Updated {datetime.now():%H:%M:%S}")
     signals_view()
 
@@ -710,7 +836,8 @@ with tab_signals:
   +2 or more = up bias, -2 or less = down bias.
 - **Activity ×** compares the last 5 minutes' volume and price range with normal. Above 1.5× means the
   stock is waking up, and a bigger move is more likely, in either direction.
-- **Signal right % (5d)** tests the same rule on every minute of the last 5 days: when it said up/down,
+- **Signal right %** tests the same rule on every minute of the last ~10 trading days (never fewer than 5,
+  shown in **History days**; with less history there is no signal at all): when it said up/down,
   how often was the price actually up/down N minutes later? **50% is a coin flip.** Only trust stocks
   where this stays clearly above 55% with plenty of tests, and it can change any day.
 - ASX/NZX data is ~20 min delayed, so their "next 5 minutes" has already happened on the exchange.
