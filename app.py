@@ -33,6 +33,16 @@ from scanner import market_candidates
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
+# Tiger keys live only in Streamlit Secrets; copy them to the environment for tiger_data.py
+try:
+    import os as _os
+    for _k in ("TIGEROPEN_TIGER_ID", "TIGEROPEN_PRIVATE_KEY", "TIGEROPEN_ACCOUNT", "TIGEROPEN_LICENSE"):
+        if _k in st.secrets and not _os.environ.get(_k):
+            _os.environ[_k] = str(st.secrets[_k])
+except Exception:
+    pass
+import tiger_data  # noqa: E402  (read-only prices, never trades)
+
 WATCHLIST_FILE = Path(__file__).with_name("watchlist.json")
 
 MARKETS = {
@@ -255,7 +265,16 @@ with st.sidebar:
                                 help="Hides penny stocks, which swing wildly on tiny trades")
     min_volume = st.number_input("Minimum volume today", 0, 10_000_000, 50_000, 10_000)
     max_rows = st.slider("Max stocks per direction", 10, 100, 25, 5)
-    st.caption("US prices are near real-time. ASX and NZX are delayed about 20 minutes.")
+    st.subheader("Price source")
+    if tiger_data.configured():
+        ts = tiger_data.status()
+        if ts["ok"]:
+            st.success("🐯 Tiger connected (read-only): official live US prices")
+        else:
+            st.error(f"🐯 Tiger: {ts['message'][:160]}. Using Yahoo instead.")
+    else:
+        st.caption("Yahoo Finance (free). Add Tiger keys in Streamlit Secrets for official US prices.")
+    st.caption("ASX and NZX are delayed about 20 minutes.")
 
 st.title("📈 Stock Tracker: USA · Australia · New Zealand")
 
@@ -302,6 +321,25 @@ def live_feed() -> LiveFeed:
     return LiveFeed()
 
 
+@st.cache_data(ttl=2, show_spinner=False)
+def tiger_prices(symbols: tuple[str, ...]) -> dict:
+    return tiger_data.prices(symbols) if tiger_data.configured() else {}
+
+
+def best_prices(symbols, feed) -> dict:
+    """Newest price per share: Tiger (US, if connected) first, then the Yahoo live stream."""
+    out = {}
+    tg = tiger_prices(tuple(symbols))
+    for s in symbols:
+        if s in tg:
+            out[s] = (tg[s]["price"], "tiger")
+        else:
+            m = feed.get(s)
+            if m:
+                out[s] = (m["price"], "yahoo")
+    return out
+
+
 @st.cache_data(ttl=20, show_spinner=False)
 def fallback_price(symbol: str):
     try:
@@ -326,7 +364,7 @@ NOW_CSS = """
 """
 
 
-def signal_card(r: dict, tick: str, live: bool) -> str:
+def signal_card(r: dict, tick: str, live) -> str:
     cls = {"BUY NOW": "sig-buy", "SELL NOW": "sig-sell"}.get(r["Action"], "sig-wait")
     icon = {"BUY NOW": "🟢", "SELL NOW": "🔵"}.get(r["Action"], "⏸️")
     dcls = "up" if (r["Day %"] or 0) >= 0 else "down"
@@ -342,7 +380,30 @@ def signal_card(r: dict, tick: str, live: bool) -> str:
             f"<span class='sig-price'>{tick} {r['Price']:,.3f} <span class='{dcls}' style='font-size:.75em'>"
             f"{r['Day %']:+.2f}%</span></span></div>"
             f"<div class='sig-sub'>Score {r['Score']:+d} · signal right {right} · last 5 min {r['Last 5 min %']:+.2f}% · "
-            f"RSI {rsi} · {'⚡ live' if live else '1-min data'}</div>{plan}</div>")
+            f"RSI {rsi} · {'⚡ live (Tiger)' if live == 'tiger' else '⚡ live' if live else '1-min data'}</div>{plan}</div>")
+
+
+def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
+    """Record new BUY/SELL signals in the Signal Log and send phone alerts (if switched on)."""
+    sent = st.session_state.setdefault("alert_state", {})
+    app_log = st.session_state.setdefault("app_log", [])
+    push_on = st.session_state.get("alerts_on") and st.session_state.get("ntfy_topic")
+    live = set(open_markets(my_tz))
+    for r in rows:
+        act = r["Action"]
+        if market_of(r["Symbol"]) not in live:
+            continue   # market closed: last-session setups are for practice only, never alert or log
+        if act in ("BUY NOW", "SELL NOW") and sent.get(r["Symbol"]) != act:
+            app_log.append({"Time (UTC)": pd.Timestamp.now(tz="UTC").floor("s"), "Symbol": r["Symbol"],
+                            "Action": act, "Price": r["Price"], "Stop-loss": r["Stop-loss"],
+                            "Target": r["Target"], "Score": r["Score"], "Right %": r["Right %"],
+                            "Horizon": horizon, "Source": source})
+            if push_on:
+                title, body = alert_text(r)
+                send_push(st.session_state["ntfy_topic"], title, body, act)
+                st.toast(title)
+        sent[r["Symbol"]] = act
+
 
 
 with tab_now:
@@ -380,13 +441,13 @@ with tab_now:
         bars = bars_many(tuple(wl))
         prev_px = st.session_state.setdefault("prev_px", {})
         rows, live_flags = [], {}
+        px_now = best_prices(wl, feed)
         for s in wl:
             b = bars.get(s)
             if b is None or b.empty or len(b) < 30:
                 continue
-            m = feed.get(s)
-            px = m["price"] if m else None
-            live_flags[s] = m is not None
+            px, src = px_now.get(s, (None, None))
+            live_flags[s] = src
             try:
                 rows.append(live_signal(s, b, px, now_h, now_hit))
             except Exception:
@@ -402,23 +463,8 @@ with tab_now:
                 return "•"
             return "<span class='up'>▲</span>" if new > old else "<span class='down'>▼</span>"
 
-        # Phone alert when a share CHANGES into BUY NOW or SELL NOW
-        # and record every new signal in the Signal Log
-        sent = st.session_state.setdefault("alert_state", {})
-        app_log = st.session_state.setdefault("app_log", [])
-        push_on = st.session_state.get("alerts_on") and st.session_state.get("ntfy_topic")
-        for r in rows:
-            act = r["Action"]
-            if act in ("BUY NOW", "SELL NOW") and sent.get(r["Symbol"]) != act:
-                app_log.append({"Time (UTC)": pd.Timestamp.now(tz="UTC").floor("s"), "Symbol": r["Symbol"],
-                                "Action": act, "Price": r["Price"], "Stop-loss": r["Stop-loss"],
-                                "Target": r["Target"], "Score": r["Score"], "Right %": r["Right %"],
-                                "Horizon": now_h, "Source": "app"})
-                if push_on:
-                    title, body = alert_text(r)
-                    send_push(st.session_state["ntfy_topic"], title, body, act)
-                    st.toast(title)
-            sent[r["Symbol"]] = act
+        # Phone alerts + Signal Log (only for shares whose market is open right now)
+        log_and_alert(rows, now_h, "app")
 
         buys = sorted([r for r in rows if r["Action"] == "BUY NOW"], key=lambda r: -r["Score"])
         sells = sorted([r for r in rows if r["Action"] == "SELL NOW"], key=lambda r: r["Score"])
@@ -436,9 +482,10 @@ with tab_now:
         with st.expander(f"⏸️ Wait / no clear signal ({len(waits)})", expanded=False):
             st.markdown("".join(signal_card(r, tick_for(r), live_flags.get(r["Symbol"])) for r in waits),
                         unsafe_allow_html=True)
-        n_live = sum(live_flags.values())
+        n_live = sum(1 for v in live_flags.values() if v)
+        n_tiger = sum(1 for v in live_flags.values() if v == "tiger")
         st.caption(f"{datetime.now():%H:%M:%S} · live stream: {'connected' if feed.connected else 'connecting…'} · "
-                   f"{n_live}/{len(wl)} stocks ticking live")
+                   f"{n_live}/{len(wl)} stocks ticking live" + (f" ({n_tiger} from Tiger)" if n_tiger else ""))
 
     now_view()
     st.caption("🟢 BUY NOW = score +2 or more and the signal has been right at least your minimum % on this stock "
@@ -463,23 +510,6 @@ def top_candidates(market: str, per_side: int) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
-    """Record new BUY/SELL signals in the Signal Log and send phone alerts (if switched on)."""
-    sent = st.session_state.setdefault("alert_state", {})
-    app_log = st.session_state.setdefault("app_log", [])
-    push_on = st.session_state.get("alerts_on") and st.session_state.get("ntfy_topic")
-    for r in rows:
-        act = r["Action"]
-        if act in ("BUY NOW", "SELL NOW") and sent.get(r["Symbol"]) != act:
-            app_log.append({"Time (UTC)": pd.Timestamp.now(tz="UTC").floor("s"), "Symbol": r["Symbol"],
-                            "Action": act, "Price": r["Price"], "Stop-loss": r["Stop-loss"],
-                            "Target": r["Target"], "Score": r["Score"], "Right %": r["Right %"],
-                            "Horizon": horizon, "Source": source})
-            if push_on:
-                title, body = alert_text(r)
-                send_push(st.session_state["ntfy_topic"], title, body, act)
-                st.toast(title)
-        sent[r["Symbol"]] = act
 
 
 with tab_top:
@@ -503,7 +533,8 @@ with tab_top:
         if live_mkts:
             st.caption("Scanning markets open now: " + ", ".join(live_mkts))
         else:
-            st.warning("No market is open right now. Showing the last session's setups for practice only.")
+            st.warning("No market is open right now. Showing the last session's setups for practice only "
+                       "(no phone alerts are sent while markets are closed).")
 
         cands = [top_candidates(m, 10) for m in mkts]
         cands = pd.concat([c for c in cands if not c.empty], ignore_index=True) if any(
@@ -523,14 +554,15 @@ with tab_top:
         info = cands.drop_duplicates("Symbol").set_index("Symbol")
         prev_px = st.session_state.setdefault("prev_px", {})
         rows, live_flags = [], {}
+        px_now = best_prices(syms, feed)
         for s in syms:
             b = bars.get(s)
             if b is None or b.empty or len(b) < 120:
                 continue
-            m = feed.get(s)
-            live_flags[s] = m is not None
+            px, src = px_now.get(s, (None, None))
+            live_flags[s] = src
             try:
-                r = live_signal(s, b, m["price"] if m else None, top_h, top_hit)
+                r = live_signal(s, b, px, top_h, top_hit)
             except Exception:
                 continue
             r["Market"] = info.at[s, "Market"]
