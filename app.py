@@ -423,11 +423,20 @@ def signal_card(r: dict, tick: str, live) -> str:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def _session_movers_ok(market: str, day) -> pd.DataFrame:
+    df = session_movers(market, day)
+    if df.empty:
+        raise RuntimeError("no daily prices loaded")   # raising = not cached, so the next refresh retries
+    return df
+
+
 def session_movers_cached(market: str, day) -> pd.DataFrame:
     try:
-        return session_movers(market, day)
-    except Exception:
-        return pd.DataFrame()
+        return _session_movers_ok(market, day)
+    except Exception as e:
+        out = pd.DataFrame()
+        out.attrs["error"] = str(e)
+        return out
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -778,7 +787,8 @@ if VIEW == "top":
             session_day = sess[0] if top_day == "latest" else sess[1]
             rows, bars = session_rows(session_day)
             if not rows:
-                st.info("Couldn't load that day's prices yet. Try again in a minute.")
+                st.warning("Couldn't load that day's prices yet (Yahoo may be busy). It retries automatically, "
+                           "or refresh the page in a minute.")
                 return
             live_flags = {}
             cands = None
@@ -1100,11 +1110,21 @@ if VIEW == "movers":
                     df = pd.DataFrame()
                 else:
                     mv = session_movers_cached(market, day)
-                    df = pd.DataFrame() if mv.empty else mv[
-                        (mv["Change %"].abs() >= min_move) & (mv["Price"] >= min_price) & (mv["Volume"] >= min_volume)]
-                    if not df.empty:
-                        df = df.sort_values("Change %", key=abs, ascending=False).head(max_rows * 2)[
-                            ["Symbol", "Company", "Price", "Change %", "Day range %", "Volume", "Volume ×"]]
+                    if mv.empty:
+                        st.warning(f"Couldn't load {market} daily prices right now "
+                                   f"({mv.attrs.get('error', 'no data')}). It will retry on the next refresh.")
+                        continue
+                    cols = ["Symbol", "Company", "Price", "Change %", "Day range %", "Volume", "Volume ×"]
+                    ok = mv[(mv["Price"] >= min_price) & (mv["Volume"] >= min_volume)]
+                    df = ok[ok["Change %"].abs() >= min_move]
+                    st.caption(f"Checked {len(mv)} of {mv.attrs.get('universe', len(mv))} biggest companies "
+                               f"for {day_label(day)}.")
+                    if df.empty and not ok.empty:
+                        st.info(f"No share moved {min_move:g}% or more. Biggest moves that day:")
+                        df = pd.concat([ok.nlargest(5, "Change %"), ok.nsmallest(5, "Change %")]
+                                       ).drop_duplicates("Symbol")
+                    df = df.sort_values("Change %", key=abs, ascending=False).head(max_rows * 2)[cols] \
+                        if not df.empty else df
             except Exception as e:
                 st.warning(f"Couldn't load {market} movers right now ({e}).")
                 continue

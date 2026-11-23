@@ -126,13 +126,29 @@ def session_movers(market: str, day) -> pd.DataFrame:
     uni = largest_shares(market, SESSION_UNIVERSE[market])
     if uni.empty:
         return pd.DataFrame()
-    data = yf.download(uni["Symbol"].tolist(), period="2mo", interval="1d", group_by="ticker",
-                       auto_adjust=False, threads=True, progress=False)
+    syms_all = uni["Symbol"].tolist()
+    frames = {}
+    for i in range(0, len(syms_all), 100):          # smaller batches: one failure doesn't lose everything
+        chunk = syms_all[i:i + 100]
+        try:
+            data = yf.download(chunk, period="2mo", interval="1d", group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+        except Exception:
+            continue
+        if data is None or data.empty:
+            continue
+        for sym in chunk:
+            try:
+                frames[sym] = data[sym] if isinstance(data.columns, pd.MultiIndex) else data
+            except Exception:
+                pass
     names = dict(zip(uni["Symbol"], uni["Company"]))
     out = []
-    for sym in uni["Symbol"]:
+    for sym in syms_all:
         try:
-            d = data[sym] if isinstance(data.columns, pd.MultiIndex) else data
+            if sym not in frames:
+                continue
+            d = frames[sym]
             d = d.dropna(subset=["Close"])
             dates = [pd.Timestamp(x).date() for x in d.index]
             if day not in dates:
@@ -153,4 +169,7 @@ def session_movers(market: str, day) -> pd.DataFrame:
                         "Date": day})
         except Exception:
             continue
-    return pd.DataFrame(out)
+    df = pd.DataFrame(out)
+    df.attrs["universe"] = len(syms_all)
+    df.attrs["loaded"] = len(frames)
+    return df
