@@ -21,6 +21,8 @@ import exchange_calendars as xc
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 from yfinance import EquityQuery as Q
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -280,6 +282,21 @@ with st.sidebar:
                                 help="Hides penny stocks, which swing wildly on tiny trades")
     min_volume = st.number_input("Minimum volume today", 0, 10_000_000, 50_000, 10_000)
     max_rows = st.slider("Max stocks per direction", 10, 100, 25, 5)
+    with st.expander("📲 Phone alerts", expanded=False):
+        st.caption("Install the free **ntfy** app (Play Store), tap **+**, and subscribe to a private topic name "
+                   "only you know, e.g. `upeksha-stocks-7391`. Enter the same name here. "
+                   "These alerts work while this app is open; the GitHub checker covers when it is closed.")
+        default_topic = st.query_params.get("ntfy", "")
+        ntfy_topic = st.text_input("ntfy topic", value=default_topic, key="ntfy_topic").strip()
+        alerts_on = st.toggle("Send BUY / SELL alerts to my phone", value=bool(ntfy_topic), key="alerts_on")
+        if ntfy_topic:
+            st.query_params["ntfy"] = ntfy_topic
+        if ntfy_topic and st.button("Send test alert"):
+            ok = send_push(ntfy_topic, "✅ Stock Tracker test", "Alerts are working.", "info")
+            if ok:
+                st.success(f"Sent to topic '{ntfy_topic}'. Check your phone.")
+            else:
+                st.error("Couldn't send. Check the topic name.")
     st.subheader("Price source")
     if tiger_data.configured():
         ts = tiger_data.status()
@@ -300,8 +317,15 @@ def status_view():
     st.caption("Live now: " + (", ".join(live) if live else "no market is open right now"))
 status_view()
 
-tab_top, tab_now, tab_log, tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
-    ["🏆 Top Picks", "⚡ My Shares", "📒 Signal Log", "🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
+# Menu: only the selected screen runs (much faster than tabs, which all run on every refresh)
+VIEWS = {"top": "🏆 Top Picks", "now": "⚡ My Shares", "log": "📒 Signal Log", "ideas": "🎯 Trade Ideas",
+         "movers": "🔥 Big Movers", "watch": "⭐ Watchlist", "chart": "📊 Live Chart", "signals": "🔮 Signals",
+         "pick": "➕ Pick Companies"}
+_start = st.query_params.get("view", "top")
+VIEW = st.segmented_control("Screen", list(VIEWS), default=_start if _start in VIEWS else "top", key="view",
+                            format_func=lambda v: VIEWS[v], label_visibility="collapsed") or "top"
+if st.query_params.get("view") != VIEW:
+    st.query_params["view"] = VIEW
 
 # ---------------------------------------------------------------- 1-minute bars
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -421,7 +445,7 @@ def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
 
 
 
-with tab_now:
+if VIEW == "now":
     st.markdown(NOW_CSS, unsafe_allow_html=True)
     st.markdown("**Buy now / sell now for my selected shares**")
     c1, c2, c3 = st.columns(3)
@@ -429,21 +453,6 @@ with tab_now:
                          key="now_h")
     now_hit = c2.slider("Min. signal right %", 50, 70, 55, key="now_hit")
     now_refresh = c3.selectbox("Refresh", [1, 2, 5], format_func=lambda s: f"every {s}s", key="now_ref")
-    with st.expander("📲 Phone alerts", expanded=False):
-        st.caption("Install the free **ntfy** app (Play Store), tap **+**, and subscribe to a private topic name "
-                   "only you know, e.g. `upeksha-stocks-7391`. Enter the same name here. "
-                   "These alerts work while this app is open; the GitHub checker covers when it is closed.")
-        default_topic = st.query_params.get("ntfy", "")
-        ntfy_topic = st.text_input("ntfy topic", value=default_topic, key="ntfy_topic").strip()
-        alerts_on = st.toggle("Send BUY / SELL alerts to my phone", value=bool(ntfy_topic), key="alerts_on")
-        if ntfy_topic:
-            st.query_params["ntfy"] = ntfy_topic
-        if ntfy_topic and st.button("Send test alert"):
-            ok = send_push(ntfy_topic, "✅ Stock Tracker test", "Alerts are working.", "info")
-            if ok:
-                st.success(f"Sent to topic '{ntfy_topic}'. Check your phone.")
-            else:
-                st.error("Couldn't send. Check the topic name.")
 
     @st.fragment(run_every=now_refresh)
     def now_view():
@@ -684,7 +693,7 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
                    if r.get("Right %") is not None else "") + "</span></div>", unsafe_allow_html=True)
 
 
-with tab_top:
+if VIEW == "top":
     st.markdown(NOW_CSS + RANK_CSS, unsafe_allow_html=True)
     short = {"USA": "US", "Australia (ASX)": "ASX", "New Zealand (NZX)": "NZX"}
     live_now = open_markets(my_tz)
@@ -805,7 +814,7 @@ def bars_7d(symbol: str) -> pd.DataFrame:
     return bars_1m(symbol)
 
 
-with tab_log:
+if VIEW == "log":
     st.markdown("**Were the signals right?** Every BUY/SELL signal with its time and price, "
                 "checked against what the price did next.")
     c1, c2 = st.columns([3, 1])
@@ -906,7 +915,7 @@ def scan_universe(markets: tuple[str, ...], watchlist: tuple[str, ...]) -> list[
     return list(dict.fromkeys(syms))[:100]
 
 
-with tab_ideas:
+if VIEW == "ideas":
     st.markdown("**Best buy / sell setups right now**, ranked by how reliable the signal has been "
                 "for each stock and how active it is.")
     c1, c2, c3 = st.columns(3)
@@ -999,7 +1008,7 @@ with tab_ideas:
 """)
 
 # ---------------------------------------------------------------- 1. Big movers
-with tab_movers:
+if VIEW == "movers":
     @st.fragment(run_every=refresh)
     def movers_view():
         st.caption(f"Stocks up or down at least {min_move:g}% today · updated {datetime.now():%H:%M:%S}")
@@ -1026,7 +1035,7 @@ with tab_movers:
     movers_view()
 
 # ---------------------------------------------------------------- 2. Watchlist
-with tab_watch:
+if VIEW == "watch":
     alert_pct = st.number_input("Highlight my stocks moving more than (%)", 0.5, 50.0, 3.0, 0.5)
 
     @st.fragment(run_every=refresh)
@@ -1065,7 +1074,7 @@ with tab_watch:
 
 
 # ---------------------------------------------------------------- 3. Live chart
-with tab_chart:
+if VIEW == "chart":
     if not st.session_state.watchlist:
         st.info("Add companies to your watchlist first.")
     else:
@@ -1099,7 +1108,7 @@ with tab_chart:
         chart_view()
 
 # ---------------------------------------------------------------- 4. Signals
-with tab_signals:
+if VIEW == "signals":
     st.markdown("**Which of my stocks look ready to move in the next few minutes?**")
     horizon = st.radio("Look ahead", [1, 2, 5, 10, 15], index=2, horizontal=True,
                        format_func=lambda m: f"{m} min",
@@ -1159,7 +1168,7 @@ with tab_signals:
 """)
 
 # ---------------------------------------------------------------- 5. Pick companies
-with tab_pick:
+if VIEW == "pick":
     market = st.radio("Market", list(MARKETS), horizontal=True)
     try:
         all_cos = company_list(market)

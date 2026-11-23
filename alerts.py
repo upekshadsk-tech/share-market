@@ -10,6 +10,7 @@ Settings come from environment variables (GitHub repo secrets / variables):
   APP_URL      link to your Streamlit app (optional, tapping the alert opens it)
   HORIZON      signal look-ahead in minutes (default 5)
   MIN_HIT      minimum "signal right %" (default 55)
+  TIGEROPEN_* optional Tiger keys (read-only US prices), see tiger_data.py
   LOG_PATH     where to save the signal log CSV (the workflow saves it to the signal-log branch)
 """
 
@@ -22,6 +23,8 @@ from pathlib import Path
 import exchange_calendars as xc
 import pandas as pd
 import yfinance as yf
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 from notify import alert_text, send_push
 from scanner import SCAN_MARKETS, is_open, market_candidates
