@@ -1,2 +1,2 @@
 Time (UTC),Symbol,Action,Price,Stop-loss,Target,Score,Right %,Tests,Horizon,Source,Price +5m,Price +10m,Price +15m,+5m %,+10m %,+15m %,Best %,Worst %,Result,Minutes
-2026-11-23 21:03:59,VNT.NZ,BUY NOW,5.66,5.6214,5.7371,3,63.3,79,5,scan,,,,,,,,,,
+2026-11-23 21:03:59,VNT.NZ,BUY NOW,5.66,5.6214,5.7371,3,63.3,79,5,scan,,,,,,,,,⏳ Waiting,
