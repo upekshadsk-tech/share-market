@@ -84,3 +84,73 @@ def market_candidates(market: str, side: str = "buy", top: int = 15) -> pd.DataF
     if df.empty:
         return df
     return df.sort_values("Rank", ascending=False).head(top).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- previous sessions (from daily history)
+SESSION_UNIVERSE = {"USA": 300, "Australia (ASX)": 200, "New Zealand (NZX)": 150}
+
+
+def sessions(market: str, n: int = 2) -> list:
+    """The last `n` trading days, newest first. Today counts only if the market has opened."""
+    cal = xc.get_calendar(SCAN_MARKETS[market]["cal"])
+    now = pd.Timestamp.now(tz="UTC")
+    out = []
+    for s in reversed(cal.sessions_in_range(now.normalize().tz_localize(None) - pd.Timedelta(days=20),
+                                            now.normalize().tz_localize(None))):
+        if cal.session_open(s) <= now:
+            out.append(pd.Timestamp(s).date())
+        if len(out) == n:
+            break
+    return out
+
+
+def largest_shares(market: str, size: int) -> pd.DataFrame:
+    """The market's biggest companies by market value (works any time, open or closed)."""
+    cfg = SCAN_MARKETS[market]
+    q = Q("and", [Q("eq", ["region", cfg["region"]]), Q("is-in", ["exchange", *cfg["exchanges"]]),
+                  Q("gt", ["intradayprice", cfg["min_price"]])])
+    rows = []
+    for page in range((size + 249) // 250):
+        res = yf.screen(q, sortField="intradaymarketcap", sortAsc=False, size=min(250, size - page * 250),
+                        offset=page * 250)
+        quotes = res.get("quotes", []) if isinstance(res, dict) else []
+        rows += quotes
+        if len(quotes) < 250:
+            break
+    return pd.DataFrame([{"Symbol": r.get("symbol"), "Company": r.get("shortName") or r.get("longName")}
+                         for r in rows if r.get("symbol")]).drop_duplicates("Symbol")
+
+
+def session_movers(market: str, day) -> pd.DataFrame:
+    """How each of the market's biggest shares moved on a given trading day (from daily prices)."""
+    uni = largest_shares(market, SESSION_UNIVERSE[market])
+    if uni.empty:
+        return pd.DataFrame()
+    data = yf.download(uni["Symbol"].tolist(), period="2mo", interval="1d", group_by="ticker",
+                       auto_adjust=False, threads=True, progress=False)
+    names = dict(zip(uni["Symbol"], uni["Company"]))
+    out = []
+    for sym in uni["Symbol"]:
+        try:
+            d = data[sym] if isinstance(data.columns, pd.MultiIndex) else data
+            d = d.dropna(subset=["Close"])
+            dates = [pd.Timestamp(x).date() for x in d.index]
+            if day not in dates:
+                continue
+            i = dates.index(day)
+            if i == 0:
+                continue
+            row, prev = d.iloc[i], d.iloc[i - 1]
+            vol_avg = d["Volume"].iloc[max(0, i - 20):i].mean()
+            hi, lo, close = float(row["High"]), float(row["Low"]), float(row["Close"])
+            out.append({"Symbol": sym, "Company": names.get(sym), "Market": market,
+                        "Price": close, "Prev close": float(prev["Close"]),
+                        "Change %": (close / float(prev["Close"]) - 1) * 100,
+                        "Day range %": (hi - lo) / lo * 100 if lo else None,
+                        "Near day high": (close - lo) / (hi - lo) if hi > lo else 0.5,
+                        "Volume": float(row["Volume"]),
+                        "Volume ×": float(row["Volume"]) / vol_avg if vol_avg else None,
+                        "Date": day})
+        except Exception:
+            continue
+    return pd.DataFrame(out)

@@ -31,7 +31,7 @@ from signals import (EVAL_HORIZONS, MIN_HISTORY_DAYS, add_indicators, buy_sell_p
                      fetch_history_1m, fetch_today_1m, live_signal, summarise, trade_idea)
 from live import LiveFeed
 from notify import alert_text, send_push
-from scanner import market_candidates
+from scanner import market_candidates, session_movers, sessions
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
@@ -207,7 +207,7 @@ def show_table(df: pd.DataFrame, alert_pct: float | None = None):
     styler = df.style.format({
         "Price": "{:,.3f}", "Change": "{:+,.3f}", "Change %": "{:+.2f}%",
         "Day range %": "{:.2f}%", "Day low": "{:,.3f}", "Day high": "{:,.3f}",
-        "Volume": "{:,.0f}", "Market cap": "{:,.0f}",
+        "Volume": "{:,.0f}", "Market cap": "{:,.0f}", "Volume ×": "{:.1f}×",
     }, na_rep="–")
     cols = [c for c in ("Change", "Change %") if c in df.columns]
     if cols:
@@ -420,6 +420,23 @@ def signal_card(r: dict, tick: str, live) -> str:
             f"{r['Day %']:+.2f}%</span></span></div>"
             f"<div class='sig-sub'>Score {r['Score']:+d} · signal right {right} · last 5 min {r['Last 5 min %']:+.2f}% · "
             f"RSI {rsi} · {'⚡ live (Tiger)' if live == 'tiger' else '⚡ live' if live else '1-min data'}</div>{plan}</div>")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def session_movers_cached(market: str, day) -> pd.DataFrame:
+    try:
+        return session_movers(market, day)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def sessions_cached(market: str, n: int = 2, _minute: str = "") -> list:
+    return sessions(market, n)
+
+
+def day_label(d) -> str:
+    return pd.Timestamp(d).strftime("%a %d %b")
 
 
 def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
@@ -701,6 +718,13 @@ if VIEW == "top":
     top_mkt = st.segmented_control("Market", list(MARKETS), default=default, key="top_mkt",
                                    format_func=lambda m: f"{MARKETS[m]['flag']} {short[m]}"
                                    + (" ●" if m in live_now else ""), label_visibility="collapsed") or default
+    sess = sessions_cached(top_mkt, 2, pd.Timestamp.now().strftime("%Y%m%d%H"))
+    top_live = top_mkt in live_now
+    day_opts = ["latest", "before"] if len(sess) > 1 else ["latest"]
+    day_lbl = {"latest": ("Today (live)" if top_live else f"Last session · {day_label(sess[0])}") if sess else "Latest",
+               "before": f"Day before · {day_label(sess[1])}" if len(sess) > 1 else ""}
+    top_day = st.segmented_control("Day", day_opts, default="latest", key="top_day",
+                                   format_func=lambda k: day_lbl[k], label_visibility="collapsed") or "latest"
     with st.expander("⚙️ Options", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         top_h = c1.selectbox("Signal for next", [1, 2, 5, 10, 15], index=2, format_func=lambda m: f"{m} min",
@@ -709,42 +733,90 @@ if VIEW == "top":
         top_show = c3.selectbox("Show", ["BUY & SELL first, then others", "Only BUY & SELL signals"], key="top_show")
         top_ref = c4.selectbox("Refresh", [2, 5, 10, 30], index=1, format_func=lambda s: f"every {s}s", key="top_ref")
 
-    @st.fragment(run_every=top_ref)
+    def session_rows(day):
+        """Top movers of a finished trading day, with the signal as it stood at that day's close."""
+        mv = session_movers_cached(top_mkt, day)
+        if mv.empty:
+            return [], {}
+        ups = mv[(mv["Change %"] > 0.5) & (mv["Near day high"] >= 0.5)].nlargest(10, "Change %")
+        downs = mv[(mv["Change %"] < -0.5) & (mv["Near day high"] <= 0.5)].nsmallest(10, "Change %")
+        if ups.empty and downs.empty:
+            ups, downs = mv.nlargest(10, "Change %"), mv.nsmallest(10, "Change %")
+        pick = pd.concat([ups, downs]).drop_duplicates("Symbol")
+        syms = tuple(pick["Symbol"])
+        with st.spinner(f"Loading {len(syms)} shares for {day_label(day)}…"):
+            bars = bars_many(syms)
+        rows, used = [], {}
+        for _, m in pick.iterrows():
+            s = m["Symbol"]
+            b = bars.get(s)
+            r = None
+            if b is not None and not b.empty:
+                bt = b[b.index.date <= day]
+                if len(bt) > 120 and bt.index[-1].date() == day:
+                    try:
+                        r = live_signal(s, bt, None, top_h, top_hit)
+                        r["Pressure"] = buy_sell_pressure(bt)
+                        used[s] = bt
+                    except Exception:
+                        r = None
+            if r is None:   # no minute data (some small NZX/ASX shares): show the day's move only
+                r = {"Symbol": s, "Action": "WAIT", "Score": 0, "Right %": None, "History days": 0,
+                     "Stop-loss": None, "Target": None, "RSI": None, "Pressure": None}
+            r["Price"], r["Day %"], r["Company"] = m["Price"], m["Change %"], m["Company"]
+            rows.append(r)
+        return rows, used
+
+    @st.fragment(run_every=top_ref if (top_live and top_day == "latest") else None)
     def top_view():
-        is_live = top_mkt in live_now
-        cands = top_candidates(top_mkt, 10)
-        if cands.empty:
+        is_live = top_live and top_day == "latest"
+        session_day = None
+        if not is_live:
+            if not sess:
+                st.info("No trading days found.")
+                return
+            session_day = sess[0] if top_day == "latest" else sess[1]
+            rows, bars = session_rows(session_day)
+            if not rows:
+                st.info("Couldn't load that day's prices yet. Try again in a minute.")
+                return
+            live_flags = {}
+            cands = None
+        else:
+            cands = top_candidates(top_mkt, 10)
+        if is_live and cands.empty:
             st.info("The market scan returned nothing yet. Try again in a minute.")
             return
-        syms = tuple(dict.fromkeys(cands["Symbol"]))
-        feed = live_feed()
-        feed.watch(syms)
-        first = f"top_loaded_{top_mkt}" not in st.session_state
-        with st.spinner(f"Checking {len(syms)} shares (at least 5 trading days of history each)…"
-                        + (" The first load takes about a minute." if first else "")):
-            bars = bars_many(syms)
-        st.session_state[f"top_loaded_{top_mkt}"] = True
+        if is_live:
+            syms = tuple(dict.fromkeys(cands["Symbol"]))
+            feed = live_feed()
+            feed.watch(syms)
+            first = f"top_loaded_{top_mkt}" not in st.session_state
+            with st.spinner(f"Checking {len(syms)} shares (at least 5 trading days of history each)…"
+                            + (" The first load takes about a minute." if first else "")):
+                bars = bars_many(syms)
+            st.session_state[f"top_loaded_{top_mkt}"] = True
 
-        info = cands.drop_duplicates("Symbol").set_index("Symbol")
-        px_now = best_prices(syms, feed)
-        rows, live_flags = [], {}
-        for s in syms:
-            b = bars.get(s)
-            if b is None or b.empty or len(b) < 120:
-                continue
-            px, src = px_now.get(s, (None, None))
-            live_flags[s] = src
-            try:
-                r = live_signal(s, b, px, top_h, top_hit)
-            except Exception:
-                continue
-            r["Company"] = info.at[s, "Company"]
-            r["Pressure"] = buy_sell_pressure(b)
-            rows.append(r)
-        if not rows:
-            st.info("No price data yet. Try again shortly.")
-            return
-        log_and_alert(rows, top_h, "app")
+            info = cands.drop_duplicates("Symbol").set_index("Symbol")
+            px_now = best_prices(syms, feed)
+            rows, live_flags = [], {}
+            for s in syms:
+                b = bars.get(s)
+                if b is None or b.empty or len(b) < 120:
+                    continue
+                px, src = px_now.get(s, (None, None))
+                live_flags[s] = src
+                try:
+                    r = live_signal(s, b, px, top_h, top_hit)
+                except Exception:
+                    continue
+                r["Company"] = info.at[s, "Company"]
+                r["Pressure"] = buy_sell_pressure(b)
+                rows.append(r)
+            if not rows:
+                st.info("No price data yet. Try again shortly.")
+                return
+            log_and_alert(rows, top_h, "app")
 
         def order(r):
             act = {"BUY NOW": 0, "SELL NOW": 0}.get(r["Action"], 1)
@@ -754,8 +826,8 @@ if VIEW == "top":
             rows = [r for r in rows if r["Action"] in ("BUY NOW", "SELL NOW")]
 
         tz = MARKETS[top_mkt]["tz"]
-        upd = pd.Timestamp.now(tz=tz).strftime("%m/%d %H:%M:%S %Z")
-        note = "" if is_live else " · market closed: last session, practice only"
+        upd = pd.Timestamp.now(tz=tz).strftime("%m/%d %H:%M:%S %Z") if is_live else "close of day"
+        note = "" if is_live else f" · {day_label(session_day)} (closed day, no alerts)"
         n_buy = sum(r["Action"] == "BUY NOW" for r in rows)
         n_sell = sum(r["Action"] == "SELL NOW" for r in rows)
         sel = st.session_state.get("top_detail")
@@ -1009,18 +1081,36 @@ if VIEW == "ideas":
 
 # ---------------------------------------------------------------- 1. Big movers
 if VIEW == "movers":
-    @st.fragment(run_every=refresh)
+    mv_day = st.segmented_control("Day", ["latest", "before"], default="latest", key="mv_day",
+                                  format_func=lambda k: "Today / last session" if k == "latest" else "Day before",
+                                  label_visibility="collapsed") or "latest"
+    live_mk = open_markets(my_tz)
+
+    @st.fragment(run_every=refresh if (mv_day == "latest" and live_mk) else None)
     def movers_view():
-        st.caption(f"Stocks up or down at least {min_move:g}% today · updated {datetime.now():%H:%M:%S}")
         for market in chosen_markets:
-            st.subheader(market)
+            sess_m = sessions_cached(market, 2, pd.Timestamp.now().strftime("%Y%m%d%H"))
+            use_live = mv_day == "latest" and market in live_mk
+            day = None if use_live else (sess_m[0] if mv_day == "latest" else (sess_m[1] if len(sess_m) > 1 else None))
+            st.subheader(market + ("  ·  🟢 live" if use_live else f"  ·  {day_label(day)}" if day else ""))
             try:
-                df = big_movers(market, min_move, min_price, int(min_volume), max_rows)
+                if use_live:
+                    df = big_movers(market, min_move, min_price, int(min_volume), max_rows)
+                elif day is None:
+                    df = pd.DataFrame()
+                else:
+                    mv = session_movers_cached(market, day)
+                    df = pd.DataFrame() if mv.empty else mv[
+                        (mv["Change %"].abs() >= min_move) & (mv["Price"] >= min_price) & (mv["Volume"] >= min_volume)]
+                    if not df.empty:
+                        df = df.sort_values("Change %", key=abs, ascending=False).head(max_rows * 2)[
+                            ["Symbol", "Company", "Price", "Change %", "Day range %", "Volume", "Volume ×"]]
             except Exception as e:
                 st.warning(f"Couldn't load {market} movers right now ({e}).")
                 continue
             if df.empty:
-                st.info("No stocks past the threshold (the market may be closed or quiet).")
+                st.info(f"No shares moved {min_move:g}% or more" + ("" if use_live else
+                        " that day (checked the market's biggest companies)") + ". Try a smaller % in Settings.")
                 continue
             up, down = df[df["Change %"] > 0], df[df["Change %"] < 0]
             c1, c2, c3 = st.columns(3)
@@ -1028,10 +1118,12 @@ if VIEW == "movers":
             c2.metric("Big fallers", len(down))
             c3.metric("Biggest move", f"{df.iloc[0]['Symbol']}", f"{df.iloc[0]['Change %']:+.1f}%")
             show_table(df)
-            pick = st.multiselect("Add to my watchlist", df["Symbol"].tolist(), key=f"add_{market}")
-            if pick and st.button("Add selected", key=f"btn_{market}"):
+            pick = st.multiselect("Add to my watchlist", df["Symbol"].tolist(), key=f"add_{market}_{mv_day}")
+            if pick and st.button("Add selected", key=f"btn_{market}_{mv_day}"):
                 save_watchlist(list(dict.fromkeys(st.session_state.watchlist + pick)))
                 st.toast(f"Added {', '.join(pick)}")
+        st.caption(f"Up or down at least {min_move:g}%. Live markets use today's scan of every share; closed days use "
+                   f"daily prices of each market's biggest companies · {datetime.now():%H:%M:%S}")
     movers_view()
 
 # ---------------------------------------------------------------- 2. Watchlist
