@@ -266,8 +266,8 @@ def status_view():
     st.caption("Live now: " + (", ".join(live) if live else "no market is open right now"))
 status_view()
 
-tab_now, tab_log, tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
-    ["⚡ Buy / Sell Now", "📒 Signal Log", "🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
+tab_top, tab_now, tab_log, tab_ideas, tab_movers, tab_watch, tab_chart, tab_signals, tab_pick = st.tabs(
+    ["🏆 Top Picks", "⚡ My Shares", "📒 Signal Log", "🎯 Trade Ideas", "🔥 Big Movers", "⭐ My Watchlist", "📊 Live Chart", "🔮 Signals", "➕ Pick Companies"])
 
 # ---------------------------------------------------------------- 1-minute bars
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -445,6 +445,152 @@ with tab_now:
                f"over at least {MIN_HISTORY_DAYS} past trading days (usually ~10). 🔵 SELL NOW = score -2 or less, same test. "
                "'WAIT (unreliable)' = the signal points one way but hasn't been accurate enough for this stock. "
                "Live ticks are near real-time for US stocks; ASX/NZX are ~20 min delayed. Not financial advice.")
+
+
+
+# ---------------------------------------------------------------- Top picks (whole market, automatic)
+@st.cache_data(ttl=180, show_spinner=False)
+def top_candidates(market: str, per_side: int) -> pd.DataFrame:
+    frames = []
+    for side in ("buy", "sell"):
+        try:
+            c = market_candidates(market, side, per_side)
+            if not c.empty:
+                c["Side"] = side
+                frames.append(c)
+        except Exception:
+            pass
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
+    """Record new BUY/SELL signals in the Signal Log and send phone alerts (if switched on)."""
+    sent = st.session_state.setdefault("alert_state", {})
+    app_log = st.session_state.setdefault("app_log", [])
+    push_on = st.session_state.get("alerts_on") and st.session_state.get("ntfy_topic")
+    for r in rows:
+        act = r["Action"]
+        if act in ("BUY NOW", "SELL NOW") and sent.get(r["Symbol"]) != act:
+            app_log.append({"Time (UTC)": pd.Timestamp.now(tz="UTC").floor("s"), "Symbol": r["Symbol"],
+                            "Action": act, "Price": r["Price"], "Stop-loss": r["Stop-loss"],
+                            "Target": r["Target"], "Score": r["Score"], "Right %": r["Right %"],
+                            "Horizon": horizon, "Source": source})
+            if push_on:
+                title, body = alert_text(r)
+                send_push(st.session_state["ntfy_topic"], title, body, act)
+                st.toast(title)
+        sent[r["Symbol"]] = act
+
+
+with tab_top:
+    st.markdown(NOW_CSS, unsafe_allow_html=True)
+    st.markdown("**Top BUY and SELL shares right now, from every share in USA, ASX and NZX.** "
+                "Nothing to pick: the app finds them for you.")
+    c1, c2, c3, c4 = st.columns(4)
+    top_h = c1.selectbox("Signal for next", [1, 2, 5, 10, 15], index=2, format_func=lambda m: f"{m} min",
+                         key="top_h")
+    top_hit = c2.slider("Min. signal right %", 50, 70, 55, key="top_hit")
+    top_n = c3.selectbox("Show top", [3, 5, 10], index=1, key="top_n")
+    top_ref = c4.selectbox("Refresh", [2, 5, 10, 30], index=1, format_func=lambda s: f"every {s}s", key="top_ref")
+
+    @st.fragment(run_every=top_ref)
+    def top_view():
+        live_mkts = [m for m in chosen_markets if m in open_markets(my_tz)]
+        mkts = live_mkts or list(chosen_markets)
+        if not mkts:
+            st.info("Pick at least one market in Settings.")
+            return
+        if live_mkts:
+            st.caption("Scanning markets open now: " + ", ".join(live_mkts))
+        else:
+            st.warning("No market is open right now. Showing the last session's setups for practice only.")
+
+        cands = [top_candidates(m, 10) for m in mkts]
+        cands = pd.concat([c for c in cands if not c.empty], ignore_index=True) if any(
+            not c.empty for c in cands) else pd.DataFrame()
+        if cands.empty:
+            st.info("The market scan returned nothing yet. Try again in a minute.")
+            return
+        syms = tuple(dict.fromkeys(cands["Symbol"]))
+        feed = live_feed()
+        feed.watch(syms)
+        first = "top_loaded" not in st.session_state
+        with st.spinner(f"Checking {len(syms)} shares (history of at least 5 trading days each)…"
+                        + (" The first load takes about a minute." if first else "")):
+            bars = bars_many(syms)
+        st.session_state["top_loaded"] = True
+
+        info = cands.drop_duplicates("Symbol").set_index("Symbol")
+        prev_px = st.session_state.setdefault("prev_px", {})
+        rows, live_flags = [], {}
+        for s in syms:
+            b = bars.get(s)
+            if b is None or b.empty or len(b) < 120:
+                continue
+            m = feed.get(s)
+            live_flags[s] = m is not None
+            try:
+                r = live_signal(s, b, m["price"] if m else None, top_h, top_hit)
+            except Exception:
+                continue
+            r["Market"] = info.at[s, "Market"]
+            r["Company"] = info.at[s, "Company"]
+            r["Volume ×"] = info.at[s, "Volume ×"]
+            rows.append(r)
+        if not rows:
+            st.info("No price data yet. Try again shortly.")
+            return
+        log_and_alert(rows, top_h, "app")
+
+        def tick_for(r):
+            old, new = prev_px.get(r["Symbol"]), r["Price"]
+            prev_px[r["Symbol"]] = new
+            if old is None or old == new:
+                return "•"
+            return "<span class='up'>▲</span>" if new > old else "<span class='down'>▼</span>"
+
+        def card(r):
+            flag = MARKETS.get(r["Market"], {}).get("flag", "")
+            html = signal_card(r, tick_for(r), live_flags.get(r["Symbol"]))
+            extra = (f"<div class='sig-sub'>{flag} {r['Market']} · {r['Company'] or ''} · "
+                     f"volume {r['Volume ×']:.1f}× normal</div></div>")
+            return html[:-6] + extra   # insert the market line inside the card
+
+        rank = lambda r: (-(r["Right %"] or 0), -abs(r["Score"]))
+        buys = sorted([r for r in rows if r["Action"] == "BUY NOW"], key=rank)[:top_n]
+        sells = sorted([r for r in rows if r["Action"] == "SELL NOW"], key=rank)[:top_n]
+
+        cb, cs = st.columns(2)
+        with cb:
+            st.markdown(f"### 🟢 Top BUY ({len(buys)})")
+            st.markdown("".join(card(r) for r in buys) or
+                        "<div class='sig-sub'>No share passes all the checks right now. Not trading is a valid choice.</div>",
+                        unsafe_allow_html=True)
+        with cs:
+            st.markdown(f"### 🔵 Top SELL ({len(sells)})")
+            st.markdown("".join(card(r) for r in sells) or
+                        "<div class='sig-sub'>No share passes all the checks right now.</div>",
+                        unsafe_allow_html=True)
+        n_wait = len(rows) - len(buys) - len(sells)
+        st.caption(f"{datetime.now():%H:%M:%S} · {len(rows)} shares checked closely from a scan of every listed share · "
+                   f"{n_wait} not shown (signal too weak, unreliable, or under 5 days of history) · "
+                   f"live stream {'connected' if feed.connected else 'connecting…'}")
+
+    top_view()
+    with st.expander("How Top Picks are chosen"):
+        st.markdown(f"""
+1. **Every listed share** in each open market is screened. It keeps shares that trade enough to get in and out
+   easily, are moving on volume at least 1.2× normal for the time of day, and are near the day's high (BUY)
+   or low (SELL). The best 10 each way per market go to step 2. The list refreshes every 3 minutes.
+2. **History check:** about 10 trading days of 1-minute prices are loaded (minimum **{MIN_HISTORY_DAYS} days**,
+   otherwise the share is skipped).
+3. **Signal:** trend, momentum, VWAP and RSI must agree (score +2 or more for BUY, -2 or less for SELL), and the same
+   rule must have been right at least your minimum % on that share over its history.
+4. Ranked by how often the signal was right, then by signal strength.
+
+SELL means sell shares you own, or short-sell if your broker allows it. ASX/NZX prices are ~20 min delayed.
+Phone alerts use the settings in **⚡ My Shares → 📲 Phone alerts**. Not financial advice.
+""")
 
 
 # ---------------------------------------------------------------- Signal log
