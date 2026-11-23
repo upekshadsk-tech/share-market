@@ -1,0 +1,55 @@
+name: Stock alerts
+
+on:
+  schedule:
+    - cron: "0 * * * 1-5"   # every hour, Mon-Fri (UTC). The script exits fast if no market is open.
+  workflow_dispatch:        # lets you start it by hand from the Actions tab
+
+permissions:
+  contents: write           # needed to save the signal log
+
+concurrency:
+  group: stock-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Open the signal-log branch
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin signal-log; then
+            git fetch origin signal-log
+            git worktree add -B signal-log logdir origin/signal-log
+          else
+            git worktree add -b signal-log logdir
+          fi
+
+      - run: python alerts.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          APP_URL: ${{ vars.APP_URL }}
+          HORIZON: ${{ vars.HORIZON }}
+          MIN_HIT: ${{ vars.MIN_HIT }}
+          LOG_PATH: logdir/signal_log.csv
+
+      - name: Save the signal log
+        if: always()
+        run: |
+          cd logdir
+          if [ -f signal_log.csv ]; then
+            git add signal_log.csv
+            git diff --cached --quiet || { git commit -m "Signal log $(date -u +%F' '%H:%M)"; git push origin signal-log; }
+          fi
