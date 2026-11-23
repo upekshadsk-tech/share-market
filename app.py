@@ -552,11 +552,27 @@ RANK_CSS = """
 .tg-track .g{background:#25c26e}.tg-track .r{background:#ff5a4f}
 .tg-title{font-size:1.35em;font-weight:700;text-align:center;margin-top:4px}
 .tg-upd{color:#8b8d98;text-align:center;font-size:.85em;margin-bottom:6px}
+.tg-row.sel{background:#1f2130;border-radius:10px}
+[class*="st-key-tgwrap"]{background:#16171d;border-radius:14px;padding:6px 14px 8px;color:#e8e8ee}
+[class*="st-key-tgwrap"] [data-testid="stVerticalBlock"]{gap:0 !important}
+[class*="st-key-tgrow_"]{position:relative}
+[class*="st-key-tgbtn_"]{position:absolute !important;inset:0;z-index:3;margin:0 !important}
+[class*="st-key-tgbtn_"] *{width:100% !important;height:100% !important;max-width:none !important}
+[class*="st-key-tgbtn_"] button{opacity:0;cursor:pointer;padding:0;border:0}
+[class*="st-key-tgdetail"]{background:#1b1d27;border-radius:12px;padding:10px 12px;margin:2px 0 8px;color:#e8e8ee}
+.tg-dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px 10px;font-size:.82em;color:#9a9ca8;margin:4px 0 6px;padding-bottom:10px;line-height:1.35}
+.tg-dgrid b{display:block;color:#e8e8ee;font-size:1.1em}
+.tg-pred{background:#16171d;border-radius:10px;padding:8px 10px;font-size:.85em;margin-top:4px}
+[class*="st-key-tgclose_"] button{background:#2a2c36 !important;color:#e8e8ee !important;border:0 !important;
+  min-height:0 !important;padding:2px 10px !important}
+[class*="st-key-tgdetail"] [data-testid="stHorizontalBlock"]{flex-wrap:nowrap !important;align-items:center}
+[class*="st-key-tgdetail"] [data-testid="stColumn"]{min-width:0 !important}
+[class*="st-key-tgdetail"] [data-testid="stVerticalBlock"]{gap:.45rem !important}
 </style>
 """
 
 
-def rank_row(i: int, r: dict, live_src) -> str:
+def rank_row(i: int, r: dict, live_src, selected: bool = False) -> str:
     rk = f"r{i}" if i <= 3 else ""
     badge = {"BUY NOW": ("buy", "BUY"), "SELL NOW": ("sell", "SELL")}.get(r["Action"], ("wait", "WAIT"))
     chg = r.get("Day %") or 0
@@ -573,12 +589,99 @@ def rank_row(i: int, r: dict, live_src) -> str:
             if r.get("Stop-loss") is not None else "")
     live = " ⚡" if live_src else ""
     name = (r.get("Company") or r["Symbol"]).replace("<", "")
-    return (f"<div class='tg-row'><div class='tg-rank {rk}'>{i}</div>"
+    return (f"<div class='tg-row{' sel' if selected else ''}'><div class='tg-rank {rk}'>{i}</div>"
             f"<div style='min-width:0'><div class='tg-co'>{name}</div>"
             f"<div class='tg-sub'><span class='tg-badge {badge[0]}'>{badge[1]}</span>{r['Symbol']}</div></div>"
             f"<div class='tg-chg {'up' if chg >= 0 else 'down'}'>{chg:+.2f}%</div>"
             f"<div>{bar}</div>"
             f"<div class='tg-det'>Price <b>{r['Price']:,.3f}</b>{live}{right}{plan}</div></div>")
+
+
+def live_chart(symbol: str, d: pd.DataFrame, proj_minutes: int, dark: bool = False):
+    today = d[d.index.date == d.index[-1].date()]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(x=today.index, open=today["Open"], high=today["High"], low=today["Low"],
+                                 close=today["Close"], name="Price",
+                                 increasing_line_color="#16a34a", decreasing_line_color="#dc2626"), 1, 1)
+    for col, colr in (("EMA9", "#f59e0b"), ("EMA21", "#3b82f6"), ("VWAP", "#a855f7")):
+        fig.add_trace(go.Scatter(x=today.index, y=today[col], name=col, line=dict(width=1.3, color=colr)), 1, 1)
+    # Trend projection with uncertainty band
+    from signals import projection
+    p = projection(d, proj_minutes)
+    if p:
+        t0 = today.index[-1]
+        t1 = t0 + pd.Timedelta(minutes=proj_minutes)
+        last = float(today["Close"].iloc[-1])
+        fig.add_trace(go.Scatter(x=[t0, t1, t1, t0], y=[last, p["high"], p["low"], last], fill="toself",
+                                 fillcolor="rgba(148,163,184,.25)", line=dict(width=0), name="Likely range",
+                                 hoverinfo="skip"), 1, 1)
+        fig.add_trace(go.Scatter(x=[t0, t1], y=[last, p["target"]], name=f"Trend +{proj_minutes}m",
+                                 line=dict(dash="dot", color="#64748b")), 1, 1)
+    colors = ["#16a34a" if c >= o else "#dc2626" for o, c in zip(today["Open"], today["Close"])]
+    fig.add_trace(go.Bar(x=today.index, y=today["Volume"], marker_color=colors, name="Volume", showlegend=False), 2, 1)
+    if not dark:
+        fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False,
+                          legend=dict(orientation="h", y=1.08), title=f"{symbol} · today, 1-minute bars")
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+        return
+    # Dark, phone-friendly version for the Top Buys & Sells panel
+    bg, grid, txt = "#1b1d27", "#2a2c36", "#c9cad3"
+    if p:
+        t_end = today.index[-1] + pd.Timedelta(minutes=proj_minutes)
+        span = today.index[-1] - today.index[0]
+        fig.update_xaxes(range=[today.index[0], t_end + max(span * 0.04, pd.Timedelta(minutes=proj_minutes))])
+        colr = "#25c26e" if p["target"] >= float(today["Close"].iloc[-1]) else "#ff5a4f"
+        fig.add_annotation(x=t_end, y=p["target"], text=f"{p['target']:,.2f}", showarrow=True, arrowhead=0,
+                           ax=0, ay=-26, font=dict(color=colr, size=12), bgcolor=bg, row=1, col=1)
+    fig.update_layout(template="plotly_dark", paper_bgcolor=bg, plot_bgcolor=bg, height=430,
+                      margin=dict(l=4, r=4, t=8, b=4), xaxis_rangeslider_visible=False, showlegend=True,
+                      legend=dict(orientation="h", yanchor="top", y=-0.08, x=0, font=dict(size=10, color=txt)),
+                      font=dict(color=txt, size=11), hovermode="x unified")
+    fig.update_xaxes(gridcolor=grid, showline=False)
+    fig.update_yaxes(gridcolor=grid, side="right")
+    st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False, "scrollZoom": False})
+
+
+def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
+    """Today's price movement for one share plus the short-term trend projection."""
+    from signals import projection
+    with st.container(key=f"tgdetail_{sym}"):
+        top = st.columns([4, 1])
+        top[0].markdown(f"<div style='font-weight:700;font-size:1.05em'>{(r.get('Company') or sym).replace('<', '')}"
+                        f" <span style='color:#9a9ca8;font-weight:400'>· {sym}</span></div>", unsafe_allow_html=True)
+        if top[1].button("✕", key=f"tgclose_{sym}", help="Close"):
+            st.session_state["top_detail"] = None
+            st.rerun()
+        st.markdown("<div style='color:#9a9ca8;font-size:.8em'>🔮 Predict next</div>", unsafe_allow_html=True)
+        mins = st.segmented_control("Predict next", [5, 10, 15, 30], default=horizon if horizon in (5, 10, 15, 30)
+                                    else 10, key=f"tgpred_{sym}", format_func=lambda m: f"{m} min",
+                                    label_visibility="collapsed") or 10
+        d = add_indicators(bars)
+        today = d[d.index.date == d.index[-1].date()]
+        prev = d[d.index.date < d.index[-1].date()]["Close"]
+        prev_close = float(prev.iloc[-1]) if not prev.empty else float(today["Open"].iloc[0])
+        hi, lo, op = float(today["High"].max()), float(today["Low"].min()), float(today["Open"].iloc[0])
+        price = float(r["Price"])
+        rsi = f"{r['RSI']:.0f}" if r.get("RSI") is not None else "–"
+        st.markdown(
+            "<div class='tg-dgrid'>"
+            f"<div>Price<b>{price:,.3f}</b></div>"
+            f"<div>Change<b style='color:{'#25c26e' if price >= prev_close else '#ff5a4f'}'>{(price / prev_close - 1) * 100:+.2f}%</b></div>"
+            f"<div>Prev close<b>{prev_close:,.3f}</b></div>"
+            f"<div>Open<b>{op:,.3f}</b></div><div>Day high<b>{hi:,.3f}</b></div><div>Day low<b>{lo:,.3f}</b></div>"
+            f"<div>Day range<b>{(hi - lo) / lo * 100:.2f}%</b></div><div>RSI<b>{rsi}</b></div>"
+            f"<div>Signal<b>{r['Action'].replace(' NOW', '')}</b></div></div>", unsafe_allow_html=True)
+        live_chart(sym, d, mins, dark=True)
+        p = projection(d, mins)
+        if p:
+            direction = "up" if p["target"] > price else "down" if p["target"] < price else "flat"
+            st.markdown(
+                f"<div class='tg-pred'>🔮 <b>Next {mins} min (trend guide):</b> {direction} towards "
+                f"<b>{p['target']:,.3f}</b> ({(p['target'] / price - 1) * 100:+.2f}%), likely range "
+                f"<b>{p['low']:,.3f} – {p['high']:,.3f}</b>.<br><span style='color:#9a9ca8'>Straight-line trend of the "
+                f"last 15 minutes with its normal noise. A guide, not a forecast. "
+                + (f"This signal was right {r['Right %']:.0f}% of the time over {r['History days']} days."
+                   if r.get("Right %") is not None else "") + "</span></div>", unsafe_allow_html=True)
 
 
 with tab_top:
@@ -644,17 +747,31 @@ with tab_top:
         tz = MARKETS[top_mkt]["tz"]
         upd = pd.Timestamp.now(tz=tz).strftime("%m/%d %H:%M:%S %Z")
         note = "" if is_live else " · market closed: last session, practice only"
-        body = "".join(rank_row(i + 1, r, live_flags.get(r["Symbol"])) for i, r in enumerate(rows))
-        if not body:
-            body = ("<div class='tg-row' style='grid-template-columns:1fr'><div class='tg-sub'>"
-                    "No share passes all the checks right now. Not trading is a valid choice.</div></div>")
         n_buy = sum(r["Action"] == "BUY NOW" for r in rows)
         n_sell = sum(r["Action"] == "SELL NOW" for r in rows)
-        st.markdown(
-            f"<div class='tg-wrap'><div class='tg-title'>Top Buys &amp; Sells</div>"
-            f"<div class='tg-upd'>Updated at {upd}{note}<br>{n_buy} BUY · {n_sell} SELL</div>"
-            f"<div class='tg-head'><span>Rank</span><span>Company</span><span class='r'>Chg%</span>"
-            f"<span class='r'>Buy / Sell</span></div>{body}</div>", unsafe_allow_html=True)
+        sel = st.session_state.get("top_detail")
+        with st.container(key=f"tgwrap_{top_mkt.split()[0]}"):
+            st.markdown(
+                f"<div class='tg-title'>Top Buys &amp; Sells</div>"
+                f"<div class='tg-upd'>Updated at {upd}{note}<br>{n_buy} BUY · {n_sell} SELL · tap a company for its chart</div>"
+                f"<div class='tg-head'><span>Rank</span><span>Company</span><span class='r'>Chg%</span>"
+                f"<span class='r'>Buy / Sell</span></div>", unsafe_allow_html=True)
+            if not rows:
+                st.markdown("<div class='tg-row' style='grid-template-columns:1fr'><div class='tg-sub'>"
+                            "No share passes all the checks right now. Not trading is a valid choice.</div></div>",
+                            unsafe_allow_html=True)
+            for i, r in enumerate(rows):
+                sym = r["Symbol"]
+                with st.container(key=f"tgrow_{sym}"):
+                    st.markdown(rank_row(i + 1, r, live_flags.get(sym), sel == sym), unsafe_allow_html=True)
+                    if st.button("Open", key=f"tgbtn_{sym}", width="stretch"):
+                        st.session_state["top_detail"] = None if sel == sym else sym
+                        st.rerun()
+                if sel == sym:
+                    try:
+                        detail_panel(sym, r, bars[sym], top_h)
+                    except Exception as e:
+                        st.caption(f"Chart not available ({e}).")
 
     top_view()
     with st.expander("ℹ️ How this list works"):
@@ -945,33 +1062,6 @@ with tab_watch:
         if remove and st.button("Remove"):
             save_watchlist([s for s in st.session_state.watchlist if s not in remove])
             st.rerun()
-
-
-def live_chart(symbol: str, d: pd.DataFrame, proj_minutes: int):
-    today = d[d.index.date == d.index[-1].date()]
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
-    fig.add_trace(go.Candlestick(x=today.index, open=today["Open"], high=today["High"], low=today["Low"],
-                                 close=today["Close"], name="Price",
-                                 increasing_line_color="#16a34a", decreasing_line_color="#dc2626"), 1, 1)
-    for col, colr in (("EMA9", "#f59e0b"), ("EMA21", "#3b82f6"), ("VWAP", "#a855f7")):
-        fig.add_trace(go.Scatter(x=today.index, y=today[col], name=col, line=dict(width=1.3, color=colr)), 1, 1)
-    # Trend projection with uncertainty band
-    from signals import projection
-    p = projection(d, proj_minutes)
-    if p:
-        t0 = today.index[-1]
-        t1 = t0 + pd.Timedelta(minutes=proj_minutes)
-        last = float(today["Close"].iloc[-1])
-        fig.add_trace(go.Scatter(x=[t0, t1, t1, t0], y=[last, p["high"], p["low"], last], fill="toself",
-                                 fillcolor="rgba(148,163,184,.25)", line=dict(width=0), name="Likely range",
-                                 hoverinfo="skip"), 1, 1)
-        fig.add_trace(go.Scatter(x=[t0, t1], y=[last, p["target"]], name=f"Trend +{proj_minutes}m",
-                                 line=dict(dash="dot", color="#64748b")), 1, 1)
-    colors = ["#16a34a" if c >= o else "#dc2626" for o, c in zip(today["Open"], today["Close"])]
-    fig.add_trace(go.Bar(x=today.index, y=today["Volume"], marker_color=colors, name="Volume", showlegend=False), 2, 1)
-    fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False,
-                      legend=dict(orientation="h", y=1.08), title=f"{symbol} · today, 1-minute bars")
-    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
 # ---------------------------------------------------------------- 3. Live chart
