@@ -11,6 +11,32 @@ import pandas as pd
 import yfinance as yf
 from yfinance import EquityQuery as Q
 
+import time as _time
+
+
+def reset_yahoo():
+    """Throw away Yahoo's sign-in cookie/crumb so the next request gets a fresh one (fixes most 401s)."""
+    try:
+        from yfinance.data import YfData
+        d = YfData()
+        d._set_cookie_strategy("basic" if getattr(d, "_cookie_strategy", "basic") == "csrf" else "csrf")
+    except Exception:
+        pass
+
+
+def yahoo_call(fn, *args, **kwargs):
+    """Call Yahoo; on 401 / Unauthorized / crumb errors, reset the sign-in and try once more."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        msg = str(e)
+        if any(k in msg for k in ("401", "Unauthorized", "Crumb", "crumb", "Invalid Cookie")):
+            reset_yahoo()
+            _time.sleep(1)
+            return fn(*args, **kwargs)
+        raise
+
+
 SCAN_MARKETS = {
     "USA": {"region": "us", "exchanges": ["NMS", "NYQ", "NGM", "NCM", "ASE"], "cal": "XNYS",
             "min_price": 2.0, "min_dollar_vol": 20_000_000, "pages": 2},
@@ -48,10 +74,18 @@ def _query(market: str, side: str):
 
 def market_candidates(market: str, side: str = "buy", top: int = 15) -> pd.DataFrame:
     """Best `top` shares in the whole market for a BUY (or SELL) check right now."""
+    try:
+        return _screen_candidates(market, side, top)
+    except Exception:
+        return fallback_candidates(market, side, top)   # screener blocked: use the built-in company list
+
+
+def _screen_candidates(market: str, side: str, top: int) -> pd.DataFrame:
     cfg = SCAN_MARKETS[market]
     rows = []
     for page in range(cfg["pages"]):
-        res = yf.screen(_query(market, side), sortField="dayvolume", sortAsc=False, size=250, offset=page * 250)
+        res = yahoo_call(yf.screen, _query(market, side), sortField="dayvolume", sortAsc=False, size=250,
+                         offset=page * 250)
         quotes = res.get("quotes", []) if isinstance(res, dict) else []
         rows += quotes
         if len(quotes) < 250:
@@ -106,13 +140,24 @@ def sessions(market: str, n: int = 2) -> list:
 
 def largest_shares(market: str, size: int) -> pd.DataFrame:
     """The market's biggest companies by market value (works any time, open or closed)."""
+    try:
+        df = _largest_shares(market, size)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+    from universe import FALLBACK
+    return pd.DataFrame({"Symbol": FALLBACK[market], "Company": FALLBACK[market]})
+
+
+def _largest_shares(market: str, size: int) -> pd.DataFrame:
     cfg = SCAN_MARKETS[market]
     q = Q("and", [Q("eq", ["region", cfg["region"]]), Q("is-in", ["exchange", *cfg["exchanges"]]),
                   Q("gt", ["intradayprice", cfg["min_price"]])])
     rows = []
     for page in range((size + 249) // 250):
-        res = yf.screen(q, sortField="intradaymarketcap", sortAsc=False, size=min(250, size - page * 250),
-                        offset=page * 250)
+        res = yahoo_call(yf.screen, q, sortField="intradaymarketcap", sortAsc=False,
+                         size=min(250, size - page * 250), offset=page * 250)
         quotes = res.get("quotes", []) if isinstance(res, dict) else []
         rows += quotes
         if len(quotes) < 250:
@@ -131,8 +176,8 @@ def session_movers(market: str, day) -> pd.DataFrame:
     for i in range(0, len(syms_all), 100):          # smaller batches: one failure doesn't lose everything
         chunk = syms_all[i:i + 100]
         try:
-            data = yf.download(chunk, period="2mo", interval="1d", group_by="ticker",
-                               auto_adjust=False, threads=True, progress=False)
+            data = yahoo_call(yf.download, chunk, period="2mo", interval="1d", group_by="ticker",
+                              auto_adjust=False, threads=True, progress=False)
         except Exception:
             continue
         if data is None or data.empty:
@@ -173,3 +218,66 @@ def session_movers(market: str, day) -> pd.DataFrame:
     df.attrs["universe"] = len(syms_all)
     df.attrs["loaded"] = len(frames)
     return df
+
+
+def daily_prices(symbols: list[str], period: str = "2mo") -> dict:
+    """Daily bars per symbol (today's bar included while the market is open), loaded in batches."""
+    frames = {}
+    for i in range(0, len(symbols), 100):
+        chunk = symbols[i:i + 100]
+        try:
+            data = yahoo_call(yf.download, chunk, period=period, interval="1d", group_by="ticker",
+                              auto_adjust=False, threads=True, progress=False)
+        except Exception:
+            continue
+        if data is None or data.empty:
+            continue
+        for sym in chunk:
+            try:
+                d = (data[sym] if isinstance(data.columns, pd.MultiIndex) else data).dropna(subset=["Close"])
+                if not d.empty:
+                    frames[sym] = d
+            except Exception:
+                pass
+    return frames
+
+
+def fallback_live(market: str) -> pd.DataFrame:
+    """Today's move for the built-in company list (used when the screener is blocked)."""
+    from universe import FALLBACK
+    syms = FALLBACK[market]
+    frames = daily_prices(syms, "2mo")
+    today = sessions(market, 1)
+    today = today[0] if today else None
+    elapsed = session_elapsed(market) if is_open(market) else 1.0
+    out = []
+    for sym, d in frames.items():
+        dates = [pd.Timestamp(x).date() for x in d.index]
+        if today not in dates:
+            continue
+        i = dates.index(today)
+        if i == 0:
+            continue
+        row, prev = d.iloc[i], d.iloc[i - 1]
+        hi, lo, price = float(row["High"]), float(row["Low"]), float(row["Close"])
+        avg = d["Volume"].iloc[max(0, i - 20):i].mean()
+        vol = float(row["Volume"])
+        out.append({"Symbol": sym, "Company": sym.split(".")[0], "Market": market, "Price": price,
+                    "Day %": (price / float(prev["Close"]) - 1) * 100,
+                    "Volume ×": vol / (avg * elapsed) if avg else 1.0,
+                    "Near day high": (price - lo) / (hi - lo) if hi > lo else 0.5,
+                    "Volume": vol, "Day range %": (hi - lo) / lo * 100 if lo else None})
+    return pd.DataFrame(out)
+
+
+def fallback_candidates(market: str, side: str = "buy", top: int = 15) -> pd.DataFrame:
+    df = fallback_live(market)
+    if df.empty:
+        return df
+    if side == "buy":
+        df = df[(df["Day %"] > 0.5) & (df["Near day high"] >= 0.6)]
+        df["Rank"] = df["Volume ×"].clip(upper=5) * df["Day %"].clip(upper=15) * df["Near day high"]
+    else:
+        df = df[(df["Day %"] < -0.5) & (df["Near day high"] <= 0.4)]
+        df["Rank"] = df["Volume ×"].clip(upper=5) * (-df["Day %"]).clip(upper=15) * (1 - df["Near day high"])
+    return df.sort_values("Rank", ascending=False).head(top).reset_index(drop=True)

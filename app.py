@@ -31,7 +31,7 @@ from signals import (EVAL_HORIZONS, MIN_HISTORY_DAYS, add_indicators, buy_sell_p
                      fetch_history_1m, fetch_today_1m, live_signal, summarise, trade_idea)
 from live import LiveFeed
 from notify import alert_text, send_push
-from scanner import market_candidates, session_movers, sessions
+from scanner import fallback_live, market_candidates, session_movers, sessions, yahoo_call
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
 
@@ -105,7 +105,7 @@ if "watchlist" not in st.session_state:
 
 # ---------------------------------------------------------------- data fetching
 def _screen_rows(query, sort_field="percentchange", sort_asc=False, size=250, offset=0):
-    res = yf.screen(query, sortField=sort_field, sortAsc=sort_asc, size=size, offset=offset)
+    res = yahoo_call(yf.screen, query, sortField=sort_field, sortAsc=sort_asc, size=size, offset=offset)
     return res.get("quotes", []) if isinstance(res, dict) else []
 
 
@@ -420,6 +420,11 @@ def signal_card(r: dict, tick: str, live) -> str:
             f"{r['Day %']:+.2f}%</span></span></div>"
             f"<div class='sig-sub'>Score {r['Score']:+d} · signal right {right} · last 5 min {r['Last 5 min %']:+.2f}% · "
             f"RSI {rsi} · {'⚡ live (Tiger)' if live == 'tiger' else '⚡ live' if live else '1-min data'}</div>{plan}</div>")
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fallback_live_cached(market: str) -> pd.DataFrame:
+    return fallback_live(market)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1105,7 +1110,15 @@ if VIEW == "movers":
             st.subheader(market + ("  ·  🟢 live" if use_live else f"  ·  {day_label(day)}" if day else ""))
             try:
                 if use_live:
-                    df = big_movers(market, min_move, min_price, int(min_volume), max_rows)
+                    try:
+                        df = big_movers(market, min_move, min_price, int(min_volume), max_rows)
+                    except Exception:   # screener blocked (e.g. HTTP 401): use the main companies list instead
+                        fb = fallback_live_cached(market)
+                        df = fb if fb.empty else fb[(fb["Day %"].abs() >= min_move) & (fb["Price"] >= min_price)
+                                                     ].rename(columns={"Day %": "Change %"}).sort_values(
+                            "Change %", key=abs, ascending=False).head(max_rows * 2)[
+                            ["Symbol", "Price", "Change %", "Day range %", "Volume", "Volume ×"]]
+                        st.caption("Yahoo's market scanner is busy, so this uses each market's main companies.")
                 elif day is None:
                     df = pd.DataFrame()
                 else:
