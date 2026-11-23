@@ -39,6 +39,15 @@ def fetch_history_1m(symbol: str, days: int = HISTORY_CALENDAR_DAYS) -> pd.DataF
 
 
 def fetch_today_1m(symbol: str) -> pd.DataFrame:
+    """Today's 1-minute bars. US shares use Tiger (if connected), otherwise Yahoo Finance."""
+    try:
+        import tiger_data
+        if tiger_data.configured() and tiger_data.is_us(symbol):
+            t = tiger_data.today_bars_1m(symbol)
+            if not t.empty and (pd.Timestamp.now(tz="UTC") - t.index[-1]) < pd.Timedelta(hours=20):
+                return t
+    except Exception:
+        pass
     import yfinance as yf
     h = yf.Ticker(symbol).history(period="1d", interval="1m", prepost=False)
     return h[OHLCV].dropna() if not h.empty else pd.DataFrame(columns=OHLCV)
@@ -302,3 +311,21 @@ def evaluate_signal(bars: pd.DataFrame, t, action: str, price: float, stop=None,
     out["Result"] = result
     out["Minutes"] = minutes
     return out
+
+
+def buy_sell_pressure(bars: pd.DataFrame) -> tuple[float, float] | None:
+    """Estimated buying vs selling pressure today: volume traded in minutes where the price rose
+    vs minutes where it fell (flat minutes split evenly). Returns (buy %, sell %)."""
+    if bars is None or bars.empty:
+        return None
+    today = bars[bars.index.date == bars.index[-1].date()]
+    if len(today) < 5:
+        return None
+    move = today["Close"].diff().fillna(today["Close"] - today["Open"])
+    vol = today["Volume"].astype(float)
+    up, down, flat = vol[move > 0].sum(), vol[move < 0].sum(), vol[move == 0].sum()
+    total = up + down + flat
+    if total <= 0:
+        return None
+    buy = (up + flat / 2) / total * 100
+    return float(buy), float(100 - buy)
