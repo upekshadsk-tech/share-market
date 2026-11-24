@@ -695,6 +695,10 @@ def live_chart(symbol: str, d: pd.DataFrame, proj_minutes: int, dark: bool = Fal
                                  line=dict(dash="dot", color="#64748b")), 1, 1)
     colors = ["#16a34a" if c >= o else "#dc2626" for o, c in zip(today["Open"], today["Close"])]
     fig.add_trace(go.Bar(x=today.index, y=today["Volume"], marker_color=colors, name="Volume", showlegend=False), 2, 1)
+    # one giant block trade shouldn't squash every other volume bar: cap the scale, the spike goes off the top
+    vcap = float(today["Volume"].quantile(0.99)) * 1.3 if len(today) > 20 else None
+    if vcap and float(today["Volume"].max()) > vcap * 2:
+        fig.update_yaxes(range=[0, vcap], row=2, col=1)
     if not dark:
         fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False,
                           legend=dict(orientation="h", y=1.08), title=f"{symbol} · today, 1-minute bars")
