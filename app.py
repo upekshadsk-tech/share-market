@@ -28,6 +28,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from signals import (EVAL_HORIZONS, MIN_HISTORY_DAYS, add_indicators, buy_sell_pressure, combine_bars, evaluate_signal,
+                     fix_day_change, official_prev_close,
                      fetch_history_1m, fetch_today_1m, live_signal, summarise, trade_idea)
 from live import LiveFeed
 from notify import alert_text, send_push
@@ -379,6 +380,16 @@ def best_prices(symbols, feed) -> dict:
     return out
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def prev_close(symbol: str):
+    return official_prev_close(symbol)
+
+
+def prev_closes(symbols) -> dict:
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        return dict(zip(symbols, pool.map(prev_close, symbols)))
+
+
 @st.cache_data(ttl=20, show_spinner=False)
 def fallback_price(symbol: str):
     try:
@@ -497,6 +508,7 @@ if VIEW == "now":
         prev_px = st.session_state.setdefault("prev_px", {})
         rows, live_flags = [], {}
         px_now = best_prices(wl, feed)
+        pcs = prev_closes(tuple(wl))
         for s in wl:
             b = bars.get(s)
             if b is None or b.empty or len(b) < 30:
@@ -504,7 +516,7 @@ if VIEW == "now":
             px, src = px_now.get(s, (None, None))
             live_flags[s] = src
             try:
-                rows.append(live_signal(s, b, px, now_h, now_hit))
+                rows.append(fix_day_change(live_signal(s, b, px, now_h, now_hit), pcs.get(s)))
             except Exception:
                 pass
         if not rows:
@@ -699,7 +711,8 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
         d = add_indicators(bars)
         today = d[d.index.date == d.index[-1].date()]
         prev = d[d.index.date < d.index[-1].date()]["Close"]
-        prev_close = float(prev.iloc[-1]) if not prev.empty else float(today["Open"].iloc[0])
+        prev_close = float(r["Prev close"]) if r.get("Prev close") else (
+            float(prev.iloc[-1]) if not prev.empty else float(today["Open"].iloc[0]))
         hi, lo, op = float(today["High"].max()), float(today["Low"].min()), float(today["Open"].iloc[0])
         price = float(r["Price"])
         rsi = f"{r['RSI']:.0f}" if r.get("RSI") is not None else "–"
@@ -814,6 +827,7 @@ if VIEW == "top":
 
             info = cands.drop_duplicates("Symbol").set_index("Symbol")
             px_now = best_prices(syms, feed)
+            pcs = prev_closes(syms)
             rows, live_flags = [], {}
             for s in syms:
                 b = bars.get(s)
@@ -822,7 +836,7 @@ if VIEW == "top":
                 px, src = px_now.get(s, (None, None))
                 live_flags[s] = src
                 try:
-                    r = live_signal(s, b, px, top_h, top_hit)
+                    r = fix_day_change(live_signal(s, b, px, top_h, top_hit), pcs.get(s))
                 except Exception:
                     continue
                 r["Company"] = info.at[s, "Company"]

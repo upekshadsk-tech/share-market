@@ -329,3 +329,32 @@ def buy_sell_pressure(bars: pd.DataFrame) -> tuple[float, float] | None:
         return None
     buy = (up + flat / 2) / total * 100
     return float(buy), float(100 - buy)
+
+
+def official_prev_close(symbol: str) -> float | None:
+    """The exchange's official previous close (Tiger if connected, otherwise Yahoo's quote).
+    Used for 'Day %' because the last 1-minute bar of the previous day can be wrong or missing."""
+    try:
+        import tiger_data
+        if tiger_data.configured() and tiger_data.is_us(symbol):
+            p = tiger_data.prices([symbol]).get(symbol, {}).get("prev_close")
+            if p and p > 0:
+                return float(p)
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        p = yf.Ticker(symbol).fast_info.previous_close
+        if p and p > 0:
+            return float(p)
+    except Exception:
+        pass
+    return None
+
+
+def fix_day_change(r: dict, prev_close: float | None) -> dict:
+    """Replace 'Day %' with the change versus the official previous close."""
+    if prev_close and r.get("Price"):
+        r["Day %"] = (float(r["Price"]) / prev_close - 1) * 100
+        r["Prev close"] = prev_close
+    return r

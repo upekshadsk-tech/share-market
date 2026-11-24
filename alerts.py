@@ -29,7 +29,7 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 from notify import alert_text, send_push
 from scanner import SCAN_MARKETS, is_open, market_candidates
 from signals import (EVAL_HORIZONS, combine_bars, evaluate_signal, fetch_history_1m, fetch_today_1m,
-                     live_signal)
+                     fix_day_change, live_signal, official_prev_close)
 
 TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 APP_URL = os.environ.get("APP_URL", "").strip() or None
@@ -103,7 +103,8 @@ def scan_whole_markets():
                 bars = get_bars(c['Symbol'])
                 if len(bars) < 120:
                     continue
-                r = live_signal(c['Symbol'], bars, None, HORIZON, MIN_HIT)
+                r = fix_day_change(live_signal(c['Symbol'], bars, None, HORIZON, MIN_HIT),
+                                   official_prev_close(c['Symbol']))
             except Exception as e:
                 print(f"{c['Symbol']}: error {e}")
                 continue
@@ -197,7 +198,7 @@ def main():
                 bars = get_bars(s)
                 if len(bars) < 30:
                     continue
-                r = live_signal(s, bars, None, HORIZON, MIN_HIT)
+                r = fix_day_change(live_signal(s, bars, None, HORIZON, MIN_HIT), official_prev_close(s))
             except Exception as e:
                 print(f"{s}: error {e}")
                 continue
