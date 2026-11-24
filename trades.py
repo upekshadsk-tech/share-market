@@ -69,6 +69,21 @@ def open_trade(topic: str, symbol: str, entry: float, shares: float, stop: float
     return t
 
 
+def update_trade(topic: str, trade: dict, stop: float, target: float) -> bool:
+    """Change the stop-loss / profit target of an open trade (same id, newest version wins)."""
+    t = {k: v for k, v in trade.items() if k != "ok"}
+    t.update(type="open", stop=float(stop), target=float(target))
+    return _post(topic, t)
+
+
+def levels_from_margin(price: float, profit_pct: float, stop_pct: float, bars=None):
+    """Target and stop from your own % margin; 0 means 'let the app choose' (from the share's normal move)."""
+    auto_stop, auto_target = default_levels(price, bars)
+    target = price * (1 + profit_pct / 100) if profit_pct and profit_pct > 0 else auto_target
+    stop = price * (1 - stop_pct / 100) if stop_pct and stop_pct > 0 else auto_stop
+    return stop, target
+
+
 def close_trade(topic: str, trade_id: str, price: float) -> bool:
     return _post(topic, {"type": "close", "id": trade_id, "price": float(price),
                          "time": pd.Timestamp.now(tz="UTC").isoformat()})

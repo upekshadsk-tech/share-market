@@ -307,6 +307,10 @@ with st.sidebar:
                 st.success(f"Sent to topic '{ntfy_topic}'. Check your phone.")
             else:
                 st.error("Couldn't send. Check the topic name.")
+    with st.expander("💼 My trade margin", expanded=False):
+        st.caption("Used when you tap ✅ I bought. 0 = let the app choose from the share's normal move.")
+        st.number_input("Sell when profit reaches (+%)", 0.0, 50.0, 0.0, 0.25, key="tp_pct")
+        st.number_input("Stop-loss if it falls (−%)", 0.0, 50.0, 0.0, 0.25, key="sl_pct")
     st.subheader("Price source")
     if tiger_data.configured():
         ts = tiger_data.status()
@@ -485,8 +489,11 @@ def record_buy(sym: str, price: float, shares: float, stop=None, target=None, ba
     if not topic:
         st.warning("Set your ntfy topic in the sidebar (📲 Phone alerts) first, so your trades can be tracked.")
         return False
-    if not stop or not target:
-        stop, target = tr.default_levels(price, bars)
+    tp, sl = st.session_state.get("tp_pct", 0.0), st.session_state.get("sl_pct", 0.0)
+    if tp or sl or not stop or not target:          # your own margin wins over the signal's levels
+        m_stop, m_target = tr.levels_from_margin(price, tp, sl, bars)
+        stop = m_stop if (sl or not stop) else stop
+        target = m_target if (tp or not target) else target
     t = tr.open_trade(topic, sym, price, shares, stop, target, market_of(sym))
     trade_events.clear()
     if t.get("ok"):
@@ -779,6 +786,15 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
             bc = st.columns([1, 2])
             sh = bc[0].number_input("Shares", min_value=0.0, value=0.0, step=1.0, key=f"tgsh_{sym}",
                                     label_visibility="collapsed", help="How many shares you bought (optional)")
+            tp_, sl_ = st.session_state.get("tp_pct", 0.0), st.session_state.get("sl_pct", 0.0)
+            pv_stop, pv_tgt = tr.levels_from_margin(price, tp_, sl_, bars)
+            if not tp_ and r.get("Target"):
+                pv_tgt = r["Target"]
+            if not sl_ and r.get("Stop-loss"):
+                pv_stop = r["Stop-loss"]
+            st.caption(f"If you buy now, I'll tell you to sell at **{pv_tgt:,.3f}** ({(pv_tgt / price - 1) * 100:+.2f}%) "
+                       f"or if it falls to **{pv_stop:,.3f}** ({(pv_stop / price - 1) * 100:+.2f}%). "
+                       "Change the margin in the sidebar: 💼 My trade margin.")
             if bc[1].button(f"✅ I bought at {price:,.3f}", key=f"tgbuy_{sym}", width="stretch"):
                 if record_buy(sym, price, sh, r.get("Stop-loss"), r.get("Target"), bars):
                     st.session_state["_goto"] = "trades"
@@ -872,7 +888,22 @@ if VIEW == "trades":
                     f"<div class='tr-sub'>Now <b>{price:,.3f}</b> · bought <b>{t['entry']:,.3f}</b> at {since}"
                     + (f" · {t['shares']:g} shares" if t.get("shares") else "")
                     + (f" · closes in {mtc:.0f} min" if mtc is not None else " · market closed") + "</div>"
-                    f"<div class='tr-why'>{adv['text']}</div></div>", unsafe_allow_html=True)
+                    f"<div class='tr-why'>{adv['text']}</div>"
+                    f"<div class='tr-sub'>Margin: sell at <b>{(t['target'] / t['entry'] - 1) * 100:+.2f}%</b> "
+                    f"({t['target']:,.3f}) · stop <b>{(t['stop'] / t['entry'] - 1) * 100:+.2f}%</b> ({t['stop']:,.3f})</div>"
+                    f"</div>", unsafe_allow_html=True)
+                with st.expander(f"✏️ Change margin for {sym}"):
+                    e1, e2, e3 = st.columns(3)
+                    cur_tp = min(max((t["target"] / t["entry"] - 1) * 100, 0.05), 50.0)
+                    cur_sl = min(max((1 - t["stop"] / t["entry"]) * 100, 0.05), 50.0)
+                    n_tp = e1.number_input("Sell at +%", 0.05, 50.0, float(round(cur_tp, 2)), 0.25, key=f"etp_{t['id']}")
+                    n_sl = e2.number_input("Stop at −%", 0.05, 50.0, float(round(cur_sl, 2)), 0.25, key=f"esl_{t['id']}")
+                    e3.caption(f"Target **{t['entry'] * (1 + n_tp / 100):,.3f}**  \nStop **{t['entry'] * (1 - n_sl / 100):,.3f}**")
+                    if st.button("Save margin", key=f"esave_{t['id']}"):
+                        tr.update_trade(topic, t, t["entry"] * (1 - n_sl / 100), t["entry"] * (1 + n_tp / 100))
+                        trade_events.clear()
+                        st.toast(f"{sym}: sell at +{n_tp:g}%, stop at −{n_sl:g}%")
+                        st.rerun()
                 sc = st.columns([1, 2])
                 sold_px = sc[0].number_input("Sold at", min_value=0.0, value=float(round(price, 3)), step=0.01,
                                              format="%.3f", key=f"soldpx_{t['id']}", label_visibility="collapsed",
@@ -924,6 +955,8 @@ if VIEW == "top":
                "before": f"Day before · {day_label(sess[1])}" if len(sess) > 1 else ""}
     top_day = st.segmented_control("Day", day_opts, default="latest", key="top_day",
                                    format_func=lambda k: day_lbl[k], label_visibility="collapsed") or "latest"
+    top_rising = st.checkbox("📈 Only rising shares that are good to buy", key="top_rising",
+                             help="Shows shares that are up today with an upward signal. BUY signals first.")
     with st.expander("⚙️ Options", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         top_h = c1.selectbox("Signal for next", [1, 2, 5, 10, 15], index=2, format_func=lambda m: f"{m} min",
@@ -1023,7 +1056,9 @@ if VIEW == "top":
             act = {"BUY NOW": 0, "SELL NOW": 0}.get(r["Action"], 1)
             return (act, -(r["Right %"] or 0), -abs(r["Score"]))
         rows.sort(key=order)
-        if top_show.startswith("Only"):
+        if top_rising:
+            rows = [r for r in rows if (r.get("Day %") or 0) > 0 and (r["Action"] == "BUY NOW" or (r.get("Score") or 0) >= 2)]
+        elif top_show.startswith("Only"):
             rows = [r for r in rows if r["Action"] in ("BUY NOW", "SELL NOW")]
 
         tz = MARKETS[top_mkt]["tz"]
