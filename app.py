@@ -32,6 +32,7 @@ from signals import (EVAL_HORIZONS, MIN_HISTORY_DAYS, add_indicators, buy_sell_p
                      fetch_history_1m, fetch_today_1m, live_signal, summarise, trade_idea)
 from live import LiveFeed
 from notify import alert_text, send_push
+import trades as tr
 from scanner import fallback_live, market_candidates, session_movers, sessions, yahoo_call
 
 st.set_page_config(page_title="Stock Tracker US / AU / NZ", page_icon="📈", layout="wide")
@@ -319,9 +320,11 @@ def status_view():
 status_view()
 
 # Menu: only the selected screen runs (much faster than tabs, which all run on every refresh)
-VIEWS = {"top": "🏆 Top Picks", "now": "⚡ My Shares", "log": "📒 Signal Log", "ideas": "🎯 Trade Ideas",
+VIEWS = {"top": "🏆 Top Picks", "trades": "💼 My Trades", "now": "⚡ My Shares", "log": "📒 Signal Log", "ideas": "🎯 Trade Ideas",
          "movers": "🔥 Big Movers", "watch": "⭐ Watchlist", "chart": "📊 Live Chart", "signals": "🔮 Signals",
          "pick": "➕ Pick Companies"}
+if st.session_state.get("_goto"):                # programmatic jump (e.g. after "I bought")
+    st.session_state["view"] = st.session_state.pop("_goto")
 _start = st.query_params.get("view", "top")
 VIEW = st.segmented_control("Screen", list(VIEWS), default=_start if _start in VIEWS else "top", key="view",
                             format_func=lambda v: VIEWS[v], label_visibility="collapsed") or "top"
@@ -462,6 +465,27 @@ def sessions_cached(market: str, n: int = 2, _minute: str = "") -> list:
 
 def day_label(d) -> str:
     return pd.Timestamp(d).strftime("%a %d %b")
+
+
+@st.cache_data(ttl=4, show_spinner=False)
+def trade_events(topic: str) -> list:
+    return tr.load_events(topic)
+
+
+def record_buy(sym: str, price: float, shares: float, stop=None, target=None, bars=None) -> bool:
+    topic = st.session_state.get("ntfy_topic", "")
+    if not topic:
+        st.warning("Set your ntfy topic in the sidebar (📲 Phone alerts) first, so your trades can be tracked.")
+        return False
+    if not stop or not target:
+        stop, target = tr.default_levels(price, bars)
+    t = tr.open_trade(topic, sym, price, shares, stop, target, market_of(sym))
+    trade_events.clear()
+    if t.get("ok"):
+        st.toast(f"✅ Tracking {sym}: bought at {price:,.3f}. I'll tell you when to sell.")
+        return True
+    st.error("Couldn't save the trade (ntfy not reachable). Try again.")
+    return False
 
 
 def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
@@ -735,6 +759,133 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
                 f"last 15 minutes with its normal noise. A guide, not a forecast. "
                 + (f"This signal was right {r['Right %']:.0f}% of the time over {r['History days']} days."
                    if r.get("Right %") is not None else "") + "</span></div>", unsafe_allow_html=True)
+        if market_of(sym) in open_markets(my_tz):
+            bc = st.columns([1, 2])
+            sh = bc[0].number_input("Shares", min_value=0.0, value=0.0, step=1.0, key=f"tgsh_{sym}",
+                                    label_visibility="collapsed", help="How many shares you bought (optional)")
+            if bc[1].button(f"✅ I bought at {price:,.3f}", key=f"tgbuy_{sym}", width="stretch"):
+                if record_buy(sym, price, sh, r.get("Stop-loss"), r.get("Target"), bars):
+                    st.session_state["_goto"] = "trades"
+                    st.rerun()
+
+
+TRADE_CSS = """
+<style>
+.tr-card{border-radius:12px;padding:10px 14px;margin:6px 0 2px;border:2px solid rgba(148,163,184,.5);
+         background:rgba(148,163,184,.10)}
+.tr-card.sell{background:#e0f2fe;border-color:#0284c7;color:#0c4a6e}
+.tr-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.tr-sym{font-size:1.25em;font-weight:800}
+.tr-act{font-weight:800;letter-spacing:.03em}
+.tr-pl{font-size:1.15em;font-weight:800}
+.tr-sub{font-size:.85em;opacity:.9;margin-top:2px}
+.tr-why{font-weight:700;margin-top:4px}
+.up{color:#15803d}.down{color:#b91c1c}
+</style>
+"""
+
+if VIEW == "trades":
+    st.markdown(TRADE_CSS, unsafe_allow_html=True)
+    st.markdown("**My day trades.** Tap **✅ I bought** on a company in 🏆 Top Picks (or add one below). "
+                "The app watches it and tells you when to sell, before the market closes.")
+    topic = st.session_state.get("ntfy_topic", "")
+    if not topic:
+        st.warning("First set your ntfy topic in the sidebar (**📲 Phone alerts**). Trades are saved there so the "
+                   "app and the background checker can both track them and alert your phone.")
+    else:
+        add_sym = st.query_params.get("add", "")
+        with st.expander("➕ Add a trade I made", expanded=bool(add_sym)):
+            c1, c2, c3 = st.columns(3)
+            a_sym = c1.text_input("Ticker", value=add_sym, placeholder="AAPL, BHP.AX, AIR.NZ").strip().upper()
+            a_px = c2.number_input("Price I paid (0 = current price)", min_value=0.0, value=0.0, step=0.01, format="%.3f")
+            a_sh = c3.number_input("Shares", min_value=0.0, value=0.0, step=1.0)
+            if a_sym and st.button("Save trade", type="primary"):
+                b = bars_1m(a_sym)
+                px = a_px or (float(b["Close"].iloc[-1]) if b is not None and not b.empty else 0)
+                if px <= 0:
+                    st.error("Couldn't get a price for that ticker. Enter the price you paid.")
+                elif record_buy(a_sym, px, a_sh, bars=b):
+                    if "add" in st.query_params:
+                        del st.query_params["add"]
+                    st.rerun()
+
+        @st.fragment(run_every=5)
+        def trades_view():
+            open_t, closed_t, alerted = tr.build(trade_events(topic))
+            today = pd.Timestamp.now(tz=my_tz).date()
+            closed_today = [t for t in closed_t if pd.Timestamp(t["exit_time"]).tz_convert(my_tz).date() == today]
+            if not open_t:
+                st.info("No open trades. When the app suggests a BUY, open it in 🏆 Top Picks and tap ✅ I bought.")
+            feed = live_feed()
+            syms = tuple(dict.fromkeys(t["symbol"] for t in open_t))
+            if syms:
+                feed.watch(syms)
+            bars = bars_many(syms) if syms else {}
+            px_now = best_prices(syms, feed) if syms else {}
+            live_set = set(open_markets(my_tz))
+            for t in open_t:
+                sym = t["symbol"]
+                b = bars.get(sym)
+                price = px_now.get(sym, (None, None))[0] or (float(b["Close"].iloc[-1]) if b is not None and not b.empty
+                                                              else t["entry"])
+                score = None
+                try:
+                    if b is not None and len(b) > 120:
+                        score = live_signal(sym, b, price, 5, 55)["Score"]
+                except Exception:
+                    pass
+                mkt = t.get("market") or market_of(sym)
+                mtc = tr.minutes_to_close(MARKETS[mkt]["cal"]) if mkt in MARKETS else None
+                adv = tr.advice(t, b, price, mtc, score)
+                sell = adv["action"] == "SELL"
+                # phone alert once per reason (shared with the background checker, so no duplicates)
+                if sell and mkt in live_set and tr.should_alert(alerted.get(t["id"]), adv["reason"]):
+                    send_push(topic, f"🔵 SELL NOW: {sym} @ {price:,.3f}",
+                              f"{adv['text']}\nP/L {adv['pl_pct']:+.2f}%" + (f" (${adv['pl']:+,.2f})" if t.get('shares') else "")
+                              + f"\nBought at {t['entry']:,.3f}. Not financial advice.", "SELL NOW")
+                    tr.mark_alerted(topic, t["id"], adv["reason"])
+                    trade_events.clear()
+                pl_cls = "up" if adv["pl_pct"] >= 0 else "down"
+                since = pd.Timestamp(t["time"]).tz_convert(my_tz).strftime("%H:%M")
+                money = f" (${adv['pl']:+,.2f})" if t.get("shares") else ""
+                st.markdown(
+                    f"<div class='tr-card {'sell' if sell else ''}'><div class='tr-top'>"
+                    f"<span class='tr-sym'>{sym}</span>"
+                    f"<span class='tr-act'>{'🔵 SELL NOW' if sell else '🟢 HOLD'}</span>"
+                    f"<span class='tr-pl {pl_cls}'>{adv['pl_pct']:+.2f}%{money}</span></div>"
+                    f"<div class='tr-sub'>Now <b>{price:,.3f}</b> · bought <b>{t['entry']:,.3f}</b> at {since}"
+                    + (f" · {t['shares']:g} shares" if t.get("shares") else "")
+                    + (f" · closes in {mtc:.0f} min" if mtc is not None else " · market closed") + "</div>"
+                    f"<div class='tr-why'>{adv['text']}</div></div>", unsafe_allow_html=True)
+                if st.button(f"💰 I sold {sym} at {price:,.3f}", key=f"sold_{t['id']}"):
+                    tr.close_trade(topic, t["id"], price)
+                    trade_events.clear()
+                    st.toast(f"Recorded: sold {sym} at {price:,.3f} ({adv['pl_pct']:+.2f}%)")
+                    st.rerun()
+
+            st.markdown("#### 📒 Today's results")
+            if not closed_today:
+                st.caption("No finished trades today yet.")
+            else:
+                df = pd.DataFrame([{"Ticker": t["symbol"], "Bought": t["entry"], "Sold": t["exit"],
+                                    "P/L %": t["pl_pct"], "P/L $": t["pl"] if t.get("shares") else None,
+                                    "Time": pd.Timestamp(t["exit_time"]).tz_convert(my_tz).strftime("%H:%M")}
+                                   for t in closed_today])
+                wins = int((df["P/L %"] > 0).sum())
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Trades", len(df))
+                m2.metric("Win rate", f"{wins / len(df) * 100:.0f}%", f"{wins} of {len(df)}")
+                tot = df["P/L $"].dropna().sum()
+                m3.metric("Total P/L", f"${tot:+,.2f}" if df["P/L $"].notna().any() else f"{df['P/L %'].mean():+.2f}% avg")
+                st.dataframe(df.style.format({"Bought": "{:,.3f}", "Sold": "{:,.3f}", "P/L %": "{:+.2f}%",
+                                              "P/L $": "{:+,.2f}"}, na_rep="–")
+                             .map(lambda v: "color:#15803d;font-weight:600" if isinstance(v, (int, float)) and v > 0
+                                  else "color:#b91c1c;font-weight:600" if isinstance(v, (int, float)) and v < 0 else "",
+                                  subset=["P/L %", "P/L $"]), hide_index=True, width="stretch")
+            st.caption(f"Updated {datetime.now():%H:%M:%S} · Sell rules: stop-loss, trailing stop once you're up, target, "
+                       f"momentum turning down while in profit, and {tr.CLOSE_WARN_MIN} min before the close. "
+                       "Brokerage fees not included. Not financial advice.")
+        trades_view()
 
 
 if VIEW == "top":

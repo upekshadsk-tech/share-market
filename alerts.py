@@ -27,6 +27,7 @@ import logging
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 from notify import alert_text, send_push
+import trades as tr
 from scanner import SCAN_MARKETS, is_open, market_candidates
 from signals import (EVAL_HORIZONS, combine_bars, evaluate_signal, fetch_history_1m, fetch_today_1m,
                      fix_day_change, live_signal, official_prev_close)
@@ -118,9 +119,38 @@ def scan_whole_markets():
             body = r["_why"] + "\n" + body
             if r["Symbol"].endswith((".AX", ".NZ")):
                 body += "\n(ASX/NZX prices ~20 min delayed)"
-            ok = send_push(TOPIC, title, body, "BUY NOW", APP_URL)
+            click = f"{APP_URL.rstrip('/')}/?view=trades&add={r['Symbol']}" if APP_URL else None
+            body += "\nTap to open the app, then ✅ I bought to track it."
+            ok = send_push(TOPIC, title, body, "BUY NOW", click)
             print(f"SCAN ALERT {title} sent={ok}")
             log_signal(r, "scan")
+
+
+def check_trades():
+    """Sell alerts for the day trades you recorded in the app (open trades on '<topic>-trades')."""
+    open_t, _, alerted = tr.build(tr.load_events(TOPIC))
+    for t in open_t:
+        sym = t["symbol"]
+        if not market_open(sym):
+            continue
+        try:
+            bars = get_bars(sym)
+            if bars.empty:
+                continue
+            price = float(bars["Close"].iloc[-1])
+            score = live_signal(sym, bars, None, 5, MIN_HIT)["Score"] if len(bars) > 120 else None
+            code = next((c for sfx, c in CAL.items() if sym.endswith(sfx)), "XNYS")
+            adv = tr.advice(t, bars, price, tr.minutes_to_close(code), score)
+        except Exception as e:
+            print(f"trade {sym}: error {e}")
+            continue
+        if adv["action"] == "SELL" and tr.should_alert(alerted.get(t["id"]), adv["reason"]):
+            body = (f"{adv['text']}\nP/L {adv['pl_pct']:+.2f}%" + (f" (${adv['pl']:+,.2f})" if t.get("shares") else "")
+                    + f"\nBought at {t['entry']:,.3f}. Not financial advice.")
+            click = f"{APP_URL.rstrip('/')}/?view=trades" if APP_URL else None
+            ok = send_push(TOPIC, f"🔵 SELL NOW: {sym} @ {price:,.3f}", body, "SELL NOW", click)
+            tr.mark_alerted(TOPIC, t["id"], adv["reason"])
+            print(f"SELL ALERT {sym} {adv['reason']} sent={ok}")
 
 
 def fill_results():
@@ -191,6 +221,10 @@ def main():
         if SCAN_ALL and time.time() >= next_scan:
             scan_whole_markets()
             next_scan = time.time() + SCAN_EVERY
+        try:
+            check_trades()
+        except Exception as e:
+            print(f"trade check error: {e}")
         for s in symbols:
             if not market_open(s):
                 continue
