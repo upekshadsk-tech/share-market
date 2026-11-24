@@ -90,7 +90,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     vol = d["Volume"].groupby(day).cumsum()
     d["VWAP"] = pv / vol.replace(0, np.nan)
 
-    d["Mom5"] = c.pct_change(5) * 100
+    day = pd.Index(d.index.date)
+    # last-5-minute move within the same day only (an overnight gap is not "momentum")
+    d["Mom5"] = c.groupby(day).pct_change(5).values * 100
     vol5 = d["Volume"].rolling(5).sum()
     d["VolSurge"] = vol5 / vol5.shift(5).rolling(60, min_periods=10).mean()
 
@@ -109,7 +111,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def hit_rate(d: pd.DataFrame, horizon: int = 5, min_score: int = 2):
     """How often |Score| >= min_score correctly called the direction `horizon` bars later."""
     future = d["Close"].shift(-horizon) - d["Close"]
-    mask = (d["Score"].abs() >= min_score) & future.notna() & (future != 0)
+    days = pd.Series(d.index.date, index=d.index)
+    same_day = days.shift(-horizon) == days          # never test across the overnight gap
+    mask = (d["Score"].abs() >= min_score) & future.notna() & (future != 0) & same_day
     n = int(mask.sum())
     if n == 0:
         return None, 0
@@ -221,7 +225,8 @@ def live_signal(symbol: str, bars: pd.DataFrame, live_price: float | None, horiz
     a9, a21 = 2 / 10, 2 / 22   # roll the EMAs forward to the live price
     ema9 = last["EMA9"] + a9 * (price - last["EMA9"])
     ema21 = last["EMA21"] + a21 * (price - last["EMA21"])
-    ref5 = d["Close"].iloc[-5] if len(d) >= 5 else d["Close"].iloc[0]
+    today_c = d["Close"][d.index.date == d.index[-1].date()]
+    ref5 = today_c.iloc[-5] if len(today_c) >= 5 else (d["Open"][d.index.date == d.index[-1].date()].iloc[0])
     mom5 = (price / ref5 - 1) * 100
     vwap = last["VWAP"]
     rsi = last["RSI"]

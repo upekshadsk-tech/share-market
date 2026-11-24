@@ -222,6 +222,14 @@ def show_table(df: pd.DataFrame, alert_pct: float | None = None):
     st.dataframe(styler, hide_index=True, width="stretch")
 
 
+def now_local():
+    """Current time in the time zone chosen in Settings (the server itself runs on UTC)."""
+    try:
+        return pd.Timestamp.now(tz=st.session_state.get("my_tz_sel") or "Pacific/Auckland")
+    except Exception:
+        return pd.Timestamp.now(tz="Pacific/Auckland")
+
+
 @st.cache_resource
 def calendar(code: str):
     return xc.get_calendar(code)
@@ -272,7 +280,7 @@ def market_status_bar(my_tz: str):
 # ---------------------------------------------------------------- sidebar settings
 with st.sidebar:
     st.header("Settings")
-    my_tz = st.selectbox("My time zone", ["Pacific/Auckland", "Australia/Sydney", "Australia/Perth",
+    my_tz = st.selectbox("My time zone", key="my_tz_sel", options=["Pacific/Auckland", "Australia/Sydney", "Australia/Perth",
                                           "America/New_York", "Asia/Colombo", "UTC"])
     only_open = st.toggle("Trade Ideas: scan only markets open now", value=True)
     chosen_markets = st.multiselect("Markets", list(MARKETS), default=list(MARKETS))
@@ -467,7 +475,7 @@ def day_label(d) -> str:
     return pd.Timestamp(d).strftime("%a %d %b")
 
 
-@st.cache_data(ttl=4, show_spinner=False)
+@st.cache_data(ttl=8, show_spinner=False)
 def trade_events(topic: str) -> list:
     return tr.load_events(topic)
 
@@ -504,9 +512,13 @@ def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
                             "Target": r["Target"], "Score": r["Score"], "Right %": r["Right %"],
                             "Horizon": horizon, "Source": source})
             if push_on:
-                title, body = alert_text(r)
-                send_push(st.session_state["ntfy_topic"], title, body, act)
-                st.toast(title)
+                topic_ = st.session_state["ntfy_topic"]
+                if not tr.signal_alerted_recently(trade_events(topic_), r["Symbol"], act):
+                    title, body = alert_text(r)
+                    send_push(topic_, title, body, act)
+                    tr.record_signal_alert(topic_, r["Symbol"], act)
+                    trade_events.clear()
+                    st.toast(title)
         sent[r["Symbol"]] = act
 
 
@@ -575,7 +587,7 @@ if VIEW == "now":
                         unsafe_allow_html=True)
         n_live = sum(1 for v in live_flags.values() if v)
         n_tiger = sum(1 for v in live_flags.values() if v == "tiger")
-        st.caption(f"{datetime.now():%H:%M:%S} · live stream: {'connected' if feed.connected else 'connecting…'} · "
+        st.caption(f"{now_local():%H:%M:%S} · live stream: {'connected' if feed.connected else 'connecting…'} · "
                    f"{n_live}/{len(wl)} stocks ticking live" + (f" ({n_tiger} from Tiger)" if n_tiger else ""))
 
     now_view()
@@ -813,7 +825,7 @@ if VIEW == "trades":
                         del st.query_params["add"]
                     st.rerun()
 
-        @st.fragment(run_every=5)
+        @st.fragment(run_every=10)
         def trades_view():
             open_t, closed_t, alerted = tr.build(trade_events(topic))
             today = pd.Timestamp.now(tz=my_tz).date()
@@ -861,10 +873,15 @@ if VIEW == "trades":
                     + (f" · {t['shares']:g} shares" if t.get("shares") else "")
                     + (f" · closes in {mtc:.0f} min" if mtc is not None else " · market closed") + "</div>"
                     f"<div class='tr-why'>{adv['text']}</div></div>", unsafe_allow_html=True)
-                if st.button(f"💰 I sold {sym} at {price:,.3f}", key=f"sold_{t['id']}"):
-                    tr.close_trade(topic, t["id"], price)
+                sc = st.columns([1, 2])
+                sold_px = sc[0].number_input("Sold at", min_value=0.0, value=float(round(price, 3)), step=0.01,
+                                             format="%.3f", key=f"soldpx_{t['id']}", label_visibility="collapsed",
+                                             help="The price your broker actually sold at")
+                if sc[1].button(f"💰 I sold {sym}", key=f"sold_{t['id']}", width="stretch"):
+                    px_ = sold_px or price
+                    tr.close_trade(topic, t["id"], px_)
                     trade_events.clear()
-                    st.toast(f"Recorded: sold {sym} at {price:,.3f} ({adv['pl_pct']:+.2f}%)")
+                    st.toast(f"Recorded: sold {sym} at {px_:,.3f} ({(px_ / t['entry'] - 1) * 100:+.2f}%)")
                     st.rerun()
 
             st.markdown("#### 📒 Today's results")
@@ -886,7 +903,7 @@ if VIEW == "trades":
                              .map(lambda v: "color:#15803d;font-weight:600" if isinstance(v, (int, float)) and v > 0
                                   else "color:#b91c1c;font-weight:600" if isinstance(v, (int, float)) and v < 0 else "",
                                   subset=["P/L %", "P/L $"]), hide_index=True, width="stretch")
-            st.caption(f"Updated {datetime.now():%H:%M:%S} · Sell rules: stop-loss, trailing stop once you're up, target, "
+            st.caption(f"Updated {now_local():%H:%M:%S} · Sell rules: stop-loss, trailing stop once you're up, target, "
                        f"momentum turning down while in profit, and {tr.CLOSE_WARN_MIN} min before the close. "
                        "Brokerage fees not included. Not financial advice.")
         trades_view()
@@ -1243,7 +1260,7 @@ if VIEW == "ideas":
                         f"right {top['Signal right %']:.0f}% of {top.Tests} past tests over {top['History days']} days</div>",
                         unsafe_allow_html=True)
             st.dataframe(part[cols].style.format(fmt, na_rep="–"), hide_index=True, width="stretch")
-        st.caption(f"Scanned {len(df)} stocks, {len(good)} passed your filters · updated {datetime.now():%H:%M:%S}")
+        st.caption(f"Scanned {len(df)} stocks, {len(good)} passed your filters · updated {now_local():%H:%M:%S}")
 
     ideas_view()
     with st.expander("How these are picked (read before trading)"):
@@ -1325,7 +1342,7 @@ if VIEW == "movers":
                 save_watchlist(list(dict.fromkeys(st.session_state.watchlist + pick)))
                 st.toast(f"Added {', '.join(pick)}")
         st.caption(f"Up or down at least {min_move:g}%. Live markets use today's scan of every share; closed days use "
-                   f"daily prices of each market's biggest companies · {datetime.now():%H:%M:%S}")
+                   f"daily prices of each market's biggest companies · {now_local():%H:%M:%S}")
     movers_view()
 
 # ---------------------------------------------------------------- 2. Watchlist
@@ -1339,7 +1356,7 @@ if VIEW == "watch":
             st.info("Your watchlist is empty. Add companies from **Pick Companies** or **Big Movers**.")
             return
         df = quotes(tuple(wl))
-        st.caption(f"{len(wl)} companies · updated {datetime.now():%H:%M:%S}")
+        st.caption(f"{len(wl)} companies · updated {now_local():%H:%M:%S}")
         movers = df[df["Change %"].abs() >= alert_pct] if "Change %" in df else pd.DataFrame()
         if not movers.empty:
             st.warning("⚠️ Big moves: " + ", ".join(
@@ -1396,7 +1413,7 @@ if VIEW == "chart":
                       help="Above 70 = stretched up, below 30 = stretched down")
             m4.metric("Volume vs normal", f"{last['VolSurge']:.1f}×" if pd.notna(last["VolSurge"]) else "–")
             live_chart(sym, d, proj_min)
-            st.caption(f"Last bar {d.index[-1]:%H:%M} exchange time · refreshed {datetime.now():%H:%M:%S}. "
+            st.caption(f"Last bar {d.index[-1]:%H:%M} exchange time · refreshed {now_local():%H:%M:%S}. "
                        "Grey cone = where a straight-line trend of the last 15 minutes would land, "
                        "with its normal noise. It is a guide, not a forecast.")
         chart_view()
@@ -1442,7 +1459,7 @@ if VIEW == "signals":
                            else "background-color:rgba(220,38,38,.15)" if v < 50 else "")
         st.dataframe(df.style.format(fmt, na_rep="–").map(sig_color, subset=["Signal"])
                      .map(trust, subset=["Signal right %"]), hide_index=True, width="stretch")
-        st.caption(f"Updated {datetime.now():%H:%M:%S}")
+        st.caption(f"Updated {now_local():%H:%M:%S}")
     signals_view()
 
     with st.expander("How to read this (please read)"):

@@ -79,6 +79,24 @@ def mark_alerted(topic: str, trade_id: str, reason: str) -> bool:
                          "time": pd.Timestamp.now(tz="UTC").isoformat()})
 
 
+def record_signal_alert(topic: str, symbol: str, action: str) -> bool:
+    return _post(topic, {"type": "signal", "symbol": symbol.upper(), "action": action,
+                         "time": pd.Timestamp.now(tz="UTC").isoformat()})
+
+
+def signal_alerted_recently(events: list[dict], symbol: str, action: str, minutes: int = 90) -> bool:
+    """True if this BUY/SELL alert was already sent (by the app on any device, or the checker) recently."""
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=minutes)
+    for e in events:
+        if e.get("type") == "signal" and e.get("symbol") == symbol.upper() and e.get("action") == action:
+            try:
+                if pd.Timestamp(e["time"]) >= cutoff:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 def build(events: list[dict]) -> tuple[list[dict], list[dict], dict]:
     """(open trades, closed trades, {trade id: set of reasons already alerted})."""
     opens, closes, alerted = {}, {}, {}

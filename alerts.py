@@ -109,7 +109,8 @@ def scan_whole_markets():
             except Exception as e:
                 print(f"{c['Symbol']}: error {e}")
                 continue
-            if r["Action"] == "BUY NOW" and not recently_alerted(c['Symbol'], "BUY NOW"):
+            if r["Action"] == "BUY NOW" and not recently_alerted(c['Symbol'], "BUY NOW") \
+                    and not tr.signal_alerted_recently(tr.load_events(TOPIC), c['Symbol'], "BUY NOW"):
                 r["_why"] = (f"{c['Company'] or ''} · {market}\nVolume {c['Volume ×']:.1f}× normal for this time of day")
                 picks.append(r)
         picks.sort(key=lambda r: (-(r["Right %"] or 0), -r["Score"]))
@@ -122,6 +123,7 @@ def scan_whole_markets():
             click = f"{APP_URL.rstrip('/')}/?view=trades&add={r['Symbol']}" if APP_URL else None
             body += "\nTap to open the app, then ✅ I bought to track it."
             ok = send_push(TOPIC, title, body, "BUY NOW", click)
+            tr.record_signal_alert(TOPIC, r["Symbol"], "BUY NOW")
             print(f"SCAN ALERT {title} sent={ok}")
             log_signal(r, "scan")
 
@@ -174,6 +176,8 @@ def fill_results():
             if now - t < pd.Timedelta(minutes=65):
                 continue
             ev = evaluate_signal(bars, t, row["Action"], row["Price"], row["Stop-loss"], row["Target"])
+            if str(ev.get("Result", "")).startswith("⏳") and now - t > pd.Timedelta(days=1):
+                ev["Result"] = "– No price data"
             for k, v in ev.items():
                 df.at[i, k] = round(v, 4) if isinstance(v, float) else v
     df[LOG_FIELDS].to_csv(LOG_PATH, index=False)
@@ -238,9 +242,11 @@ def main():
                 continue
             act = r["Action"]
             # Alert only when a share CHANGES into BUY NOW or SELL NOW (no repeats every minute)
-            if act in ("BUY NOW", "SELL NOW") and last_action.get(s) != act:
+            if act in ("BUY NOW", "SELL NOW") and last_action.get(s) != act \
+                    and not tr.signal_alerted_recently(tr.load_events(TOPIC), s, act):
                 title, body = alert_text(r)
                 ok = send_push(TOPIC, title, body, act, APP_URL)
+                tr.record_signal_alert(TOPIC, s, act)
                 print(f"ALERT {title} sent={ok}")
                 log_signal(r)
             last_action[s] = act
