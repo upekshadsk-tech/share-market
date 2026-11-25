@@ -70,10 +70,12 @@ def open_trade(topic: str, symbol: str, entry: float, shares: float, stop: float
     return t
 
 
-def update_trade(topic: str, trade: dict, stop: float, target: float) -> bool:
-    """Change the stop-loss / profit target of an open trade (same id, newest version wins)."""
+def update_trade(topic: str, trade: dict, stop: float, target: float, shares: float | None = None) -> bool:
+    """Change the stop-loss / profit target (and shares) of an open trade (same id, newest version wins)."""
     t = {k: v for k, v in trade.items() if k != "ok"}
     t.update(type="open", stop=float(stop), target=float(target), updated=pd.Timestamp.now(tz="UTC").isoformat())
+    if shares is not None:
+        t["shares"] = float(shares)
     return _post(topic, t)
 
 

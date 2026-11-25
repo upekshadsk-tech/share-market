@@ -518,6 +518,11 @@ def record_buy(sym: str, price: float, shares: float, stop=None, target=None, ba
         st.warning("Set your ntfy topic in the sidebar (📲 Phone alerts) first, so your trades can be tracked.")
         return False
     tp, sl = st.session_state.get("tp_pct", 0.0), st.session_state.get("sl_pct", 0.0)
+    # a buy needs the stop BELOW and the target ABOVE the price (a SELL signal's levels are the other way round)
+    if stop is not None and stop >= price:
+        stop = None
+    if target is not None and target <= price:
+        target = None
     if tp or sl or not stop or not target:          # your own margin wins over the signal's levels
         m_stop, m_target = tr.levels_from_margin(price, tp, sl, bars)
         stop = m_stop if (sl or not stop) else stop
@@ -662,7 +667,7 @@ RANK_CSS = """
 .tg-rank.r1{color:#ff5a4f}.tg-rank.r2{color:#ff9a3c}.tg-rank.r3{color:#f5c542}
 .tg-co{font-size:1.08em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tg-sub{font-size:.74em;color:#9a9ca8;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tg-det{grid-column:2 / -1;font-size:.76em;color:#9a9ca8;margin-top:-2px;line-height:1.35}
+.tg-det{grid-column:2 / -1;font-size:.76em;color:#9a9ca8;margin-top:-2px;line-height:1.35;padding-right:96px;min-height:22px}
 .tg-det b{color:#d6d7de;font-weight:600}
 .tg-badge{display:inline-block;font-weight:800;font-size:.95em;padding:1px 6px;border-radius:5px;margin-right:5px}
 .tg-badge.buy{background:#123d27;color:#34d77c}.tg-badge.sell{background:#0d3550;color:#5cc8ff}
@@ -682,6 +687,10 @@ RANK_CSS = """
 [class*="st-key-tgbtn_"]{position:absolute !important;inset:0;z-index:3;margin:0 !important}
 [class*="st-key-tgbtn_"] *{width:100% !important;height:100% !important;max-width:none !important}
 [class*="st-key-tgbtn_"] button{opacity:0;cursor:pointer;padding:0;border:0}
+[class*="st-key-tgbought_"]{position:absolute !important;right:0;bottom:6px;z-index:5;width:auto !important;margin:0 !important}
+[class*="st-key-tgbought_"] button{min-height:0 !important;padding:2px 10px !important;font-size:.78em !important;
+  background:#123d27 !important;color:#34d77c !important;border:1px solid #25c26e !important;border-radius:8px !important}
+[class*="st-key-tgbought_"] button:disabled{background:#2a2c36 !important;color:#9a9ca8 !important;border-color:#3a3c46 !important}
 [class*="st-key-tgdetail"]{background:#1b1d27;border-radius:12px;padding:10px 12px;margin:2px 0 8px;color:#e8e8ee}
 .tg-dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px 10px;font-size:.82em;color:#9a9ca8;margin:4px 0 6px;padding-bottom:10px;line-height:1.35}
 .tg-dgrid b{display:block;color:#e8e8ee;font-size:1.1em}
@@ -823,9 +832,9 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
                                     label_visibility="collapsed", help="How many shares you bought (optional)")
             tp_, sl_ = st.session_state.get("tp_pct", 0.0), st.session_state.get("sl_pct", 0.0)
             pv_stop, pv_tgt = tr.levels_from_margin(price, tp_, sl_, bars)
-            if not tp_ and r.get("Target"):
+            if not tp_ and r.get("Target") and r["Target"] > price:
                 pv_tgt = r["Target"]
-            if not sl_ and r.get("Stop-loss"):
+            if not sl_ and r.get("Stop-loss") and r["Stop-loss"] < price:
                 pv_stop = r["Stop-loss"]
             st.caption(f"If you buy now, I'll tell you to sell at **{pv_tgt:,.3f}** ({(pv_tgt / price - 1) * 100:+.2f}%) "
                        f"or if it falls to **{pv_stop:,.3f}** ({(pv_stop / price - 1) * 100:+.2f}%). "
@@ -834,6 +843,50 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
                 if record_buy(sym, price, sh, r.get("Stop-loss"), r.get("Target"), bars):
                     st.session_state["_goto"] = "trades"
                     st.rerun()
+
+
+def trade_chart(t: dict, bars: pd.DataFrame | None, price: float, key: str):
+    """Price since you bought + a green/red bar for every minute showing profit or loss vs your buy price."""
+    if bars is None or bars.empty:
+        st.caption("Chart appears once price data is available.")
+        return
+    t0 = pd.Timestamp(t["time"]).tz_convert(bars.index.tz)
+    b = bars[bars.index >= t0 - pd.Timedelta(minutes=1)]
+    if b.empty:
+        st.caption("Chart starts after the first minute of trading since you bought.")
+        return
+    if len(b) > 400:                       # held for days: 5-minute bars keep the chart readable
+        b = b.resample("5min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last",
+                                    "Volume": "sum"}).dropna()
+    entry = float(t["entry"])
+    pl = (b["Close"] / entry - 1) * 100
+    colors = ["#25c26e" if v >= 0 else "#ff5a4f" for v in pl]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.04)
+    fig.add_trace(go.Scatter(x=b.index, y=b["Close"], name="Price", line=dict(color="#e8e8ee", width=1.8),
+                             hovertemplate="%{y:,.3f}<extra></extra>"), 1, 1)
+    for yv, nm, col, dash in ((entry, "Bought", "#f5c542", "solid"), (t["target"], "Target", "#25c26e", "dot"),
+                              (t["stop"], "Stop", "#ff5a4f", "dot")):
+        fig.add_hline(y=yv, line=dict(color=col, width=1, dash=dash), row=1, col=1,
+                      annotation_text=f"{nm} {yv:,.2f}", annotation_position="top left",
+                      annotation_font=dict(size=10, color=col))
+    fig.add_trace(go.Bar(x=b.index, y=pl, marker_color=colors, name="Profit / loss %",
+                         hovertemplate="%{y:+.2f}%<extra></extra>"), 2, 1)
+    fig.add_hline(y=0, line=dict(color="#8b8d98", width=1), row=2, col=1)
+    lo, hi = min(b["Low"].min(), t["stop"], entry), max(b["High"].max(), t["target"], entry)
+    pad = (hi - lo) * 0.08 or entry * 0.002
+    bg = "#1b1d27"
+    fig.update_layout(template="plotly_dark", paper_bgcolor=bg, plot_bgcolor=bg, height=360, showlegend=False,
+                      margin=dict(l=4, r=4, t=6, b=4), font=dict(color="#c9cad3", size=11), hovermode="x unified",
+                      bargap=0.15)
+    fig.update_yaxes(range=[lo - pad, hi + pad], row=1, col=1, side="right", gridcolor="#2a2c36")
+    fig.update_yaxes(title_text="P/L %", row=2, col=1, side="right", gridcolor="#2a2c36", ticksuffix="%")
+    fig.update_xaxes(gridcolor="#2a2c36")
+    st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False}, key=key)
+    up = int((pl > 0).sum()); down = int((pl < 0).sum())
+    last5 = pl.iloc[-1] - pl.iloc[-6] if len(pl) > 5 else 0
+    trend = "📈 rising" if last5 > 0.05 else "📉 falling" if last5 < -0.05 else "➖ flat"
+    st.caption(f"{len(pl)} bars since you bought · {up} in profit · {down} at a loss · last 5 bars: {trend} "
+               f"({last5:+.2f}%)")
 
 
 TRADE_CSS = """
@@ -928,15 +981,17 @@ if VIEW == "trades":
                     f"<div class='tr-sub'>Margin: sell at <b>{(t['target'] / t['entry'] - 1) * 100:+.2f}%</b> "
                     f"({t['target']:,.3f}) · stop <b>{(t['stop'] / t['entry'] - 1) * 100:+.2f}%</b> ({t['stop']:,.3f})</div>"
                     f"</div>", unsafe_allow_html=True)
-                with st.expander(f"✏️ Change margin for {sym}"):
-                    e1, e2, e3 = st.columns(3)
+                trade_chart(t, b, price, key=f"trchart_{t['id']}")
+                with st.expander(f"✏️ Change margin / shares for {sym}"):
+                    e1, e2, e3, e4 = st.columns(4)
+                    n_sh = e4.number_input("Shares", 0.0, 1e9, float(t.get("shares") or 0), 1.0, key=f"esh_{t['id']}")
                     cur_tp = min(max((t["target"] / t["entry"] - 1) * 100, 0.05), 50.0)
                     cur_sl = min(max((1 - t["stop"] / t["entry"]) * 100, 0.05), 50.0)
                     n_tp = e1.number_input("Sell at +%", 0.05, 50.0, float(round(cur_tp, 2)), 0.25, key=f"etp_{t['id']}")
                     n_sl = e2.number_input("Stop at −%", 0.05, 50.0, float(round(cur_sl, 2)), 0.25, key=f"esl_{t['id']}")
                     e3.caption(f"Target **{t['entry'] * (1 + n_tp / 100):,.3f}**  \nStop **{t['entry'] * (1 - n_sl / 100):,.3f}**")
-                    if st.button("Save margin", key=f"esave_{t['id']}"):
-                        tr.update_trade(topic, t, t["entry"] * (1 - n_sl / 100), t["entry"] * (1 + n_tp / 100))
+                    if st.button("Save", key=f"esave_{t['id']}"):
+                        tr.update_trade(topic, t, t["entry"] * (1 - n_sl / 100), t["entry"] * (1 + n_tp / 100), n_sh)
                         trade_events.clear()
                         st.toast(f"{sym}: sell at +{n_tp:g}%, stop at −{n_sl:g}%")
                         st.rerun()
@@ -1126,6 +1181,8 @@ if VIEW == "top":
         n_buy = sum(r["Action"] == "BUY NOW" for r in rows)
         n_sell = sum(r["Action"] == "SELL NOW" for r in rows)
         sel = st.session_state.get("top_detail")
+        topic_ = st.session_state.get("ntfy_topic", "")
+        held = {t["symbol"] for t in tr.build(trade_events(topic_))[0]} if topic_ else set()
         with st.container(key=f"tgwrap_{top_mkt.split()[0]}"):
             st.markdown(
                 f"<div class='tg-title'>Top Buys &amp; Sells</div>"
@@ -1143,6 +1200,12 @@ if VIEW == "top":
                     if st.button("Open", key=f"tgbtn_{sym}", width="stretch"):
                         st.session_state["top_detail"] = None if sel == sym else sym
                         st.rerun()
+                    holding = sym in held
+                    if st.button("💼 Holding" if holding else "✅ I bought", key=f"tgbought_{sym}", disabled=holding,
+                                 help="Tap after you buy it in your broker: I'll track it and tell you when to sell"):
+                        if record_buy(sym, float(r["Price"]), 0.0, r.get("Stop-loss"), r.get("Target"), bars.get(sym)):
+                            st.session_state["_goto"] = "trades"
+                            st.rerun()
                 if sel == sym:
                     try:
                         detail_panel(sym, r, bars[sym], top_h)
