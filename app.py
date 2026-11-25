@@ -887,52 +887,53 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
 
 
 def trade_chart(t: dict, bars: pd.DataFrame | None, price: float, key: str):
-    """Price since you bought + a green/red bar for every minute showing profit or loss vs your buy price."""
-    if bars is None or bars.empty:
-        st.caption("Chart appears once price data is available.")
+    """Two charts, both only from the moment you bought: the price line, and a green/red profit-loss bar per minute."""
+    t0 = pd.Timestamp(t["time"])
+    b = pd.DataFrame()
+    if bars is not None and not bars.empty:
+        b = bars[bars.index >= t0.tz_convert(bars.index.tz).floor("min")]
+    if b.empty:
+        st.info(f"📈 Your charts start from your buy time ({t0.tz_convert(my_tz):%a %H:%M}). "
+                "No trading since then yet, so they'll appear when the market next trades.")
         return
-    t0 = pd.Timestamp(t["time"]).tz_convert(bars.index.tz)
-    b = bars[bars.index >= t0 - pd.Timedelta(minutes=1)]
-    waiting = False
-    if len(b) < 2:          # bought while the market is closed (or just now): show the latest session for now
-        b = bars[bars.index.date == bars.index[-1].date()]
-        waiting = True
-    if len(b) > 400:                       # held for days: 5-minute bars keep the chart readable
+    if len(b) > 400:                       # held for days: 5-minute bars keep the charts readable
         b = b.resample("5min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last",
                                     "Volume": "sum"}).dropna()
     entry = float(t["entry"])
     pl = (b["Close"] / entry - 1) * 100
-    colors = ["#25c26e" if v >= 0 else "#ff5a4f" for v in pl]
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.04)
-    fig.add_trace(go.Scatter(x=b.index, y=b["Close"], name="Price", line=dict(color="#e8e8ee", width=1.8),
-                             hovertemplate="%{y:,.3f}<extra></extra>"), 1, 1)
+    bg, grid, txt = "#1b1d27", "#2a2c36", "#c9cad3"
+    base = dict(template="plotly_dark", paper_bgcolor=bg, plot_bgcolor=bg, showlegend=False,
+                margin=dict(l=4, r=4, t=30, b=4), font=dict(color=txt, size=11), hovermode="x unified")
+
+    # 1) price since you bought
+    line = go.Figure(go.Scatter(x=b.index, y=b["Close"], line=dict(color="#e8e8ee", width=2),
+                                hovertemplate="%{y:,.3f}<extra></extra>"))
     for yv, nm, col, dash in ((entry, "Bought", "#f5c542", "solid"), (t["target"], "Target", "#25c26e", "dot"),
                               (t["stop"], "Stop", "#ff5a4f", "dot")):
-        fig.add_hline(y=yv, line=dict(color=col, width=1, dash=dash), row=1, col=1,
-                      annotation_text=f"{nm} {yv:,.2f}", annotation_position="top left",
-                      annotation_font=dict(size=10, color=col))
-    fig.add_trace(go.Bar(x=b.index, y=pl, marker_color=colors, name="Profit / loss %",
-                         hovertemplate="%{y:+.2f}%<extra></extra>"), 2, 1)
-    fig.add_hline(y=0, line=dict(color="#8b8d98", width=1), row=2, col=1)
-    lo, hi = min(b["Low"].min(), t["stop"], entry), max(b["High"].max(), t["target"], entry)
-    pad = (hi - lo) * 0.08 or entry * 0.002
-    bg = "#1b1d27"
-    fig.update_layout(template="plotly_dark", paper_bgcolor=bg, plot_bgcolor=bg, height=360, showlegend=False,
-                      margin=dict(l=4, r=4, t=6, b=4), font=dict(color="#c9cad3", size=11), hovermode="x unified",
-                      bargap=0.15)
-    fig.update_yaxes(range=[lo - pad, hi + pad], row=1, col=1, side="right", gridcolor="#2a2c36")
-    fig.update_yaxes(title_text="P/L %", row=2, col=1, side="right", gridcolor="#2a2c36", ticksuffix="%")
-    fig.update_xaxes(gridcolor="#2a2c36")
-    st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False}, key=key)
-    up = int((pl > 0).sum()); down = int((pl < 0).sum())
+        line.add_hline(y=yv, line=dict(color=col, width=1.2, dash=dash), annotation_text=f"{nm} {yv:,.2f}",
+                       annotation_position="top left", annotation_font=dict(size=10, color=col))
+    lo, hi = min(b["Close"].min(), t["stop"], entry), max(b["Close"].max(), t["target"], entry)
+    pad = (hi - lo) * 0.12 or entry * 0.002
+    line.update_layout(**base, height=260, title=dict(text="Price since you bought", font=dict(size=13), x=0.01))
+    line.update_yaxes(range=[lo - pad, hi + pad], side="right", gridcolor=grid)
+    line.update_xaxes(gridcolor=grid)
+    st.plotly_chart(line, width="stretch", theme=None, config={"displayModeBar": False}, key=f"{key}_line")
+
+    # 2) profit / loss bars: green above 0 = in profit, red below 0 = at a loss
+    bars_fig = go.Figure(go.Bar(x=b.index, y=pl, marker_color=["#25c26e" if v >= 0 else "#ff5a4f" for v in pl],
+                                hovertemplate="%{y:+.2f}%<extra></extra>"))
+    bars_fig.add_hline(y=0, line=dict(color="#8b8d98", width=1))
+    bars_fig.update_layout(**base, height=210, bargap=0.15,
+                           title=dict(text="Profit / loss since you bought", font=dict(size=13), x=0.01))
+    bars_fig.update_yaxes(side="right", gridcolor=grid, ticksuffix="%", zeroline=False)
+    bars_fig.update_xaxes(gridcolor=grid)
+    st.plotly_chart(bars_fig, width="stretch", theme=None, config={"displayModeBar": False}, key=f"{key}_bars")
+
+    up, down = int((pl > 0).sum()), int((pl < 0).sum())
     last5 = pl.iloc[-1] - pl.iloc[-6] if len(pl) > 5 else 0
     trend = "📈 rising" if last5 > 0.05 else "📉 falling" if last5 < -0.05 else "➖ flat"
-    if waiting:
-        st.caption(f"Market closed or just opened: showing the latest session ({b.index[-1]:%a %d %b}) against your "
-                   "buy price. From the next minute of trading, the chart follows your share live.")
-    else:
-        st.caption(f"{len(pl)} bars since you bought · {up} in profit · {down} at a loss · last 5 bars: {trend} "
-                   f"({last5:+.2f}%)")
+    st.caption(f"{len(pl)} bars since you bought · {up} in profit · {down} at a loss · last 5 bars: {trend} "
+               f"({last5:+.2f}%)")
 
 
 TRADE_CSS = """
