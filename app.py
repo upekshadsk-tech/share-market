@@ -12,6 +12,7 @@ unless you pay for a real-time data feed.
 """
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -309,6 +310,11 @@ with st.sidebar:
                    "only you know, e.g. `upeksha-stocks-7391`. Enter the same name here. "
                    "These alerts work while this app is open; the GitHub checker covers when it is closed.")
         default_topic = st.query_params.get("ntfy", "")
+        if not default_topic:
+            try:
+                default_topic = str(st.secrets.get("NTFY_TOPIC", ""))   # set once in Streamlit Secrets
+            except Exception:
+                default_topic = ""
         ntfy_topic = st.text_input("ntfy topic", value=default_topic, key="ntfy_topic").strip()
         alerts_on = st.toggle("Send BUY / SELL alerts to my phone", value=bool(ntfy_topic), key="alerts_on")
         if ntfy_topic:
@@ -512,10 +518,26 @@ def trade_events(topic: str) -> list:
 trade_events.clear = _trade_events_fresh.clear   # same call as before when a new event is saved
 
 
-def record_buy(sym: str, price: float, shares: float, stop=None, target=None, bars=None) -> bool:
+def flash(level: str, msg: str):
+    """Messages from tick-box actions are shown at the top of the list (callbacks can't draw on the page).
+    They stay for 20 seconds so the list's auto-refresh doesn't wipe them before you can read them."""
+    st.session_state["_flash"] = (level, msg, time.time())
+
+
+def show_flash():
+    f = st.session_state.get("_flash")
+    if f and time.time() - f[2] < 20:
+        {"success": st.success, "warning": st.warning, "error": st.error}.get(f[0], st.info)(f[1])
+    elif f:
+        st.session_state.pop("_flash", None)
+
+
+def record_buy(sym: str, price: float, shares: float, stop=None, target=None, bars=None, quiet: bool = False) -> bool:
+    say = flash if quiet else (lambda lvl, m: {"success": st.toast, "warning": st.warning, "error": st.error}[lvl](m))
     topic = st.session_state.get("ntfy_topic", "")
     if not topic:
-        st.warning("Set your ntfy topic in the sidebar (📲 Phone alerts) first, so your trades can be tracked.")
+        say("warning", "⚠️ Couldn't record the buy: enter your ntfy topic first (sidebar » → 📲 Phone alerts). "
+                       "Trades are saved there so I can track them and alert your phone.")
         return False
     tp, sl = st.session_state.get("tp_pct", 0.0), st.session_state.get("sl_pct", 0.0)
     # a buy needs the stop BELOW and the target ABOVE the price (a SELL signal's levels are the other way round)
@@ -530,9 +552,9 @@ def record_buy(sym: str, price: float, shares: float, stop=None, target=None, ba
     t = tr.open_trade(topic, sym, price, shares, stop, target, market_of(sym))
     trade_events.clear()
     if t.get("ok"):
-        st.toast(f"✅ Tracking {sym}: bought at {price:,.3f}. I'll tell you when to sell.")
+        say("success", f"✅ Tracking {sym}: bought at {price:,.3f}. I'll tell you when to sell.")
         return True
-    st.error("Couldn't save the trade (ntfy not reachable). Try again.")
+    say("error", "Couldn't save the trade (the ntfy service didn't answer). Please try again.")
     return False
 
 
@@ -545,15 +567,14 @@ def _tick_changed(key: str, sym: str, price: float, stop, target):
             bars = bars_1m(sym)
         except Exception:
             pass
-        if record_buy(sym, price, 0.0, stop, target, bars):
+        if record_buy(sym, price, 0.0, stop, target, bars, quiet=True):
             st.session_state["_goto"] = "trades"
-        else:
-            st.session_state[key] = False
+            st.session_state["_rerun_app"] = True        # switch to My Trades
     else:
         open_t = [t for t in tr.build(trade_events(topic))[0] if t["symbol"] == sym] if topic else []
         for t in open_t:
             tr.close_trade(topic, t["id"], price)
-            st.toast(f"Recorded: sold {sym} at {price:,.3f} ({(price / t['entry'] - 1) * 100:+.2f}%)")
+            flash("success", f"💰 Recorded: sold {sym} at {price:,.3f} ({(price / t['entry'] - 1) * 100:+.2f}%)")
         trade_events.clear()
 
 
@@ -952,6 +973,8 @@ if VIEW == "trades":
                         del st.query_params["add"]
                     st.rerun()
 
+        show_flash()
+
         @st.fragment(run_every=10)
         def trades_view():
             open_t, closed_t, alerted = tr.build(trade_events(topic))
@@ -1135,6 +1158,9 @@ if VIEW == "top":
 
     @st.fragment(run_every=top_ref if (top_live and top_day == "latest") else None)
     def top_view():
+        if st.session_state.pop("_rerun_app", False):
+            st.rerun(scope="app")                   # full rerun so the menu can switch to My Trades
+        show_flash()
         is_live = top_live and top_day == "latest"
         session_day = None
         if not is_live:
