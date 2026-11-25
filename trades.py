@@ -1,9 +1,10 @@
 """
 Day-trade tracker: record what you bought, then get told when to sell (same day).
 
-Trades are saved as small messages on a private ntfy topic: "<your topic>-trades".
-That lets the app (on any device) and the background checker (GitHub) see the same open
-trades with no extra account. ntfy keeps messages for about 12 hours, which suits day trading.
+Trades are saved as small messages on a private ntfy topic: "<your topic>-trades", so the app (any
+device) and the background checker see the same trades. ntfy keeps messages ~12 hours, so the
+checker also copies every event into trade_events.jsonl on the GitHub signal-log branch: open trades
+are tracked until you sell them, and your buy/sell history is kept.
 
 Sell rules for a bought share (checked every minute):
   🛑 Stop-loss hit                  price <= stop (loss limit)
@@ -72,7 +73,7 @@ def open_trade(topic: str, symbol: str, entry: float, shares: float, stop: float
 def update_trade(topic: str, trade: dict, stop: float, target: float) -> bool:
     """Change the stop-loss / profit target of an open trade (same id, newest version wins)."""
     t = {k: v for k, v in trade.items() if k != "ok"}
-    t.update(type="open", stop=float(stop), target=float(target))
+    t.update(type="open", stop=float(stop), target=float(target), updated=pd.Timestamp.now(tz="UTC").isoformat())
     return _post(topic, t)
 
 
@@ -112,6 +113,47 @@ def signal_alerted_recently(events: list[dict], symbol: str, action: str, minute
     return False
 
 
+def event_key(e: dict) -> str:
+    return json.dumps(e, sort_keys=True)
+
+
+def merge_events(*lists) -> list[dict]:
+    """Combine event lists (GitHub history + fresh ntfy), drop duplicates, oldest first."""
+    seen, out = set(), []
+    for lst in lists:
+        for e in lst or []:
+            k = event_key(e)
+            if k not in seen:
+                seen.add(k)
+                out.append(e)
+    return sorted(out, key=lambda e: e.get("updated") or e.get("time", ""))
+
+
+def read_jsonl(path) -> list[dict]:
+    try:
+        with open(path) as f:
+            return [json.loads(x) for x in f if x.strip()]
+    except Exception:
+        return []
+
+
+def write_jsonl(path, events: list[dict]):
+    with open(path, "w") as f:
+        for e in events:
+            f.write(json.dumps(e, sort_keys=True) + "\n")
+
+
+def load_history_url(url: str) -> list[dict]:
+    """Permanent trade history saved by the background checker (GitHub signal-log branch)."""
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return []
+        return [json.loads(x) for x in r.text.splitlines() if x.strip()]
+    except Exception:
+        return []
+
+
 def build(events: list[dict]) -> tuple[list[dict], list[dict], dict]:
     """(open trades, closed trades, {trade id: set of reasons already alerted})."""
     opens, closes, alerted = {}, {}, {}
@@ -121,7 +163,12 @@ def build(events: list[dict]) -> tuple[list[dict], list[dict], dict]:
         elif e["type"] == "close":
             closes[e["id"]] = e
         elif e["type"] == "alerted":
-            alerted.setdefault(e["id"], set()).add(e.get("reason"))
+            try:
+                recent = pd.Timestamp.now(tz="UTC") - pd.Timestamp(e["time"]) < pd.Timedelta(hours=12)
+            except Exception:
+                recent = True
+            if recent:      # older alerts don't count: if you still hold it, you get reminded again next session
+                alerted.setdefault(e["id"], set()).add(e.get("reason"))
     still_open = [t for i, t in opens.items() if i not in closes]
     closed = []
     for i, c in closes.items():

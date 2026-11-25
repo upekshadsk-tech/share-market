@@ -54,7 +54,5 @@ jobs:
         if: always()
         run: |
           cd logdir
-          if [ -f signal_log.csv ]; then
-            git add signal_log.csv
-            git diff --cached --quiet || { git commit -m "Signal log $(date -u +%F' '%H:%M)"; git push origin signal-log; }
-          fi
+          for f in signal_log.csv trade_events.jsonl; do [ -f "$f" ] && git add "$f"; done
+          git diff --cached --quiet || { git commit -m "Signal log $(date -u +%F' '%H:%M)"; git push origin signal-log; }

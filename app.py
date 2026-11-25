@@ -479,9 +479,25 @@ def day_label(d) -> str:
     return pd.Timestamp(d).strftime("%a %d %b")
 
 
+TRADES_HISTORY_URL = "https://raw.githubusercontent.com/upekshadsk-tech/share-market/signal-log/trade_events.jsonl"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def trade_history() -> list:
+    return tr.load_history_url(TRADES_HISTORY_URL)
+
+
 @st.cache_data(ttl=8, show_spinner=False)
-def trade_events(topic: str) -> list:
+def _trade_events_fresh(topic: str) -> list:
     return tr.load_events(topic)
+
+
+def trade_events(topic: str) -> list:
+    """Every buy/sell/alert: permanent GitHub history + the latest from ntfy."""
+    return tr.merge_events(trade_history(), _trade_events_fresh(topic))
+
+
+trade_events.clear = _trade_events_fresh.clear   # same call as before when a new event is saved
 
 
 def record_buy(sym: str, price: float, shares: float, stop=None, target=None, bars=None) -> bool:
@@ -782,7 +798,9 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
                 f"last 15 minutes with its normal noise. A guide, not a forecast. "
                 + (f"This signal was right {r['Right %']:.0f}% of the time over {r['History days']} days."
                    if r.get("Right %") is not None else "") + "</span></div>", unsafe_allow_html=True)
-        if market_of(sym) in open_markets(my_tz):
+        if True:   # always available (you may buy pre-market, or on delayed ASX/NZX prices)
+            if market_of(sym) not in open_markets(my_tz):
+                st.caption("⚠️ This market is closed now. You can still record a buy you made.")
             bc = st.columns([1, 2])
             sh = bc[0].number_input("Shares", min_value=0.0, value=0.0, step=1.0, key=f"tgsh_{sym}",
                                     label_visibility="collapsed", help="How many shares you bought (optional)")
@@ -828,7 +846,10 @@ if VIEW == "trades":
         add_sym = st.query_params.get("add", "")
         with st.expander("➕ Add a trade I made", expanded=bool(add_sym)):
             c1, c2, c3 = st.columns(3)
-            a_sym = c1.text_input("Ticker", value=add_sym, placeholder="AAPL, BHP.AX, AIR.NZ").strip().upper()
+            picks = ["Type a ticker…"] + list(dict.fromkeys(st.session_state.watchlist))
+            chosen = c1.selectbox("From my watchlist", picks, index=picks.index(add_sym) if add_sym in picks else 0)
+            a_sym = (add_sym if chosen == picks[0] else chosen)
+            a_sym = c1.text_input("Ticker", value=a_sym, placeholder="AAPL, BHP.AX, AIR.NZ").strip().upper()
             a_px = c2.number_input("Price I paid (0 = current price)", min_value=0.0, value=0.0, step=0.01, format="%.3f")
             a_sh = c3.number_input("Shares", min_value=0.0, value=0.0, step=1.0)
             if a_sym and st.button("Save trade", type="primary"):
@@ -844,8 +865,6 @@ if VIEW == "trades":
         @st.fragment(run_every=10)
         def trades_view():
             open_t, closed_t, alerted = tr.build(trade_events(topic))
-            today = pd.Timestamp.now(tz=my_tz).date()
-            closed_today = [t for t in closed_t if pd.Timestamp(t["exit_time"]).tz_convert(my_tz).date() == today]
             if not open_t:
                 st.info("No open trades. When the app suggests a BUY, open it in 🏆 Top Picks and tap ✅ I bought.")
             feed = live_feed()
@@ -915,25 +934,48 @@ if VIEW == "trades":
                     st.toast(f"Recorded: sold {sym} at {px_:,.3f} ({(px_ / t['entry'] - 1) * 100:+.2f}%)")
                     st.rerun()
 
-            st.markdown("#### 📒 Today's results")
-            if not closed_today:
-                st.caption("No finished trades today yet.")
+            st.markdown("#### 📒 Buy & sell log")
+            period = st.segmented_control("Period", ["today", "week", "all"], default="today", key="log_period",
+                                          format_func=lambda k: {"today": "Today", "week": "This week",
+                                                                 "all": "All"}[k],
+                                          label_visibility="collapsed") or "today"
+            start = {"today": pd.Timestamp.now(tz=my_tz).normalize(),
+                     "week": pd.Timestamp.now(tz=my_tz).normalize() - pd.Timedelta(days=7),
+                     "all": pd.Timestamp("2000-01-01", tz=my_tz)}[period]
+            loc = lambda x: pd.Timestamp(x).tz_convert(my_tz)
+            log_rows = []
+            for t in closed_t:
+                if loc(t["exit_time"]) >= start or loc(t["time"]) >= start:
+                    log_rows.append({"Ticker": t["symbol"], "Status": "✅ Sold", "Bought": t["entry"],
+                                     "Buy time": loc(t["time"]), "Sold": t["exit"], "Sell time": loc(t["exit_time"]),
+                                     "P/L %": t["pl_pct"], "P/L $": t["pl"] if t.get("shares") else None,
+                                     "Shares": t.get("shares") or None})
+            for t in open_t:
+                if loc(t["time"]) >= start or period != "today":
+                    log_rows.append({"Ticker": t["symbol"], "Status": "🟢 Holding", "Bought": t["entry"],
+                                     "Buy time": loc(t["time"]), "Sold": None, "Sell time": None,
+                                     "P/L %": None, "P/L $": None, "Shares": t.get("shares") or None})
+            if not log_rows:
+                st.caption("No buys or sells in this period yet.")
             else:
-                df = pd.DataFrame([{"Ticker": t["symbol"], "Bought": t["entry"], "Sold": t["exit"],
-                                    "P/L %": t["pl_pct"], "P/L $": t["pl"] if t.get("shares") else None,
-                                    "Time": pd.Timestamp(t["exit_time"]).tz_convert(my_tz).strftime("%H:%M")}
-                                   for t in closed_today])
-                wins = int((df["P/L %"] > 0).sum())
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Trades", len(df))
-                m2.metric("Win rate", f"{wins / len(df) * 100:.0f}%", f"{wins} of {len(df)}")
-                tot = df["P/L $"].dropna().sum()
-                m3.metric("Total P/L", f"${tot:+,.2f}" if df["P/L $"].notna().any() else f"{df['P/L %'].mean():+.2f}% avg")
+                df = pd.DataFrame(log_rows).sort_values("Buy time", ascending=False)
+                done = df[df["Status"] == "✅ Sold"]
+                if not done.empty:
+                    wins = int((done["P/L %"] > 0).sum())
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Finished trades", len(done))
+                    m2.metric("Win rate", f"{wins / len(done) * 100:.0f}%", f"{wins} of {len(done)}")
+                    tot = done["P/L $"].dropna().sum()
+                    m3.metric("Total P/L", f"${tot:+,.2f}" if done["P/L $"].notna().any()
+                              else f"{done['P/L %'].mean():+.2f}% avg")
+                for c in ("Buy time", "Sell time"):
+                    df[c] = df[c].apply(lambda v: v.strftime("%a %d %b %H:%M") if pd.notna(v) and v is not None else "")
                 st.dataframe(df.style.format({"Bought": "{:,.3f}", "Sold": "{:,.3f}", "P/L %": "{:+.2f}%",
-                                              "P/L $": "{:+,.2f}"}, na_rep="–")
+                                              "P/L $": "{:+,.2f}", "Shares": "{:g}"}, na_rep="–")
                              .map(lambda v: "color:#15803d;font-weight:600" if isinstance(v, (int, float)) and v > 0
                                   else "color:#b91c1c;font-weight:600" if isinstance(v, (int, float)) and v < 0 else "",
                                   subset=["P/L %", "P/L $"]), hide_index=True, width="stretch")
+                st.download_button("⬇️ Download log (CSV)", df.to_csv(index=False).encode(), "my_trades.csv", "text/csv")
             st.caption(f"Updated {now_local():%H:%M:%S} · Sell rules: stop-loss, trailing stop once you're up, target, "
                        f"momentum turning down while in profit, and {tr.CLOSE_WARN_MIN} min before the close. "
                        "Brokerage fees not included. Not financial advice.")

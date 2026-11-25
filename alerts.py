@@ -64,6 +64,20 @@ def log_signal(r: dict, source: str = "github"):
 
 
 _HIST: dict[str, tuple[float, pd.DataFrame]] = {}
+TRADES_PATH = LOG_PATH.parent / "trade_events.jsonl"
+
+
+def all_trade_events() -> list[dict]:
+    """Permanent history (GitHub file) + the last 24h from ntfy, saved back to the file."""
+    if not TOPIC:
+        return []
+    merged = tr.merge_events(tr.read_jsonl(TRADES_PATH), tr.load_events(TOPIC, "24h"))
+    try:
+        TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tr.write_jsonl(TRADES_PATH, merged)
+    except Exception as e:
+        print(f"couldn't save trade history: {e}")
+    return merged
 
 
 def get_bars(symbol: str) -> pd.DataFrame:
@@ -130,7 +144,7 @@ def scan_whole_markets():
 
 def check_trades():
     """Sell alerts for the day trades you recorded in the app (open trades on '<topic>-trades')."""
-    open_t, _, alerted = tr.build(tr.load_events(TOPIC))
+    open_t, _, alerted = tr.build(all_trade_events())
     for t in open_t:
         sym = t["symbol"]
         if not market_open(sym):
@@ -211,6 +225,11 @@ def main():
     if not TOPIC:
         sys.exit("NTFY_TOPIC is not set. Add it under Settings > Secrets and variables > Actions.")
     symbols = load_symbols()
+    try:
+        n = len(all_trade_events())
+        print(f"trade history: {n} events saved")
+    except Exception as e:
+        print(f"trade history sync error: {e}")
     try:
         fill_results()
     except Exception as e:
