@@ -536,6 +536,27 @@ def record_buy(sym: str, price: float, shares: float, stop=None, target=None, ba
     return False
 
 
+def _tick_changed(key: str, sym: str, price: float, stop, target):
+    """Tick = I bought it (start tracking). Untick = I sold it (record the sale at the current price)."""
+    topic = st.session_state.get("ntfy_topic", "")
+    if st.session_state.get(key):
+        bars = None
+        try:
+            bars = bars_1m(sym)
+        except Exception:
+            pass
+        if record_buy(sym, price, 0.0, stop, target, bars):
+            st.session_state["_goto"] = "trades"
+        else:
+            st.session_state[key] = False
+    else:
+        open_t = [t for t in tr.build(trade_events(topic))[0] if t["symbol"] == sym] if topic else []
+        for t in open_t:
+            tr.close_trade(topic, t["id"], price)
+            st.toast(f"Recorded: sold {sym} at {price:,.3f} ({(price / t['entry'] - 1) * 100:+.2f}%)")
+        trade_events.clear()
+
+
 def log_and_alert(rows: list[dict], horizon: int, source: str = "app"):
     """Record new BUY/SELL signals in the Signal Log and send phone alerts (if switched on)."""
     sent = st.session_state.setdefault("alert_state", {})
@@ -687,10 +708,9 @@ RANK_CSS = """
 [class*="st-key-tgbtn_"]{position:absolute !important;inset:0;z-index:3;margin:0 !important}
 [class*="st-key-tgbtn_"] *{width:100% !important;height:100% !important;max-width:none !important}
 [class*="st-key-tgbtn_"] button{opacity:0;cursor:pointer;padding:0;border:0}
-[class*="st-key-tgbought_"]{position:absolute !important;right:0;bottom:6px;z-index:5;width:auto !important;margin:0 !important}
-[class*="st-key-tgbought_"] button{min-height:0 !important;padding:2px 10px !important;font-size:.78em !important;
-  background:#123d27 !important;color:#34d77c !important;border:1px solid #25c26e !important;border-radius:8px !important}
-[class*="st-key-tgbought_"] button:disabled{background:#2a2c36 !important;color:#9a9ca8 !important;border-color:#3a3c46 !important}
+[class*="st-key-tgchk_"]{position:absolute !important;right:0;bottom:4px;z-index:5;width:auto !important;
+  margin:0 !important;background:#1f2130;border:1px solid #3a3c46;border-radius:8px;padding:1px 8px 1px 4px}
+[class*="st-key-tgchk_"] label p{font-size:.8em !important;color:#c9cad3 !important;font-weight:600}
 [class*="st-key-tgdetail"]{background:#1b1d27;border-radius:12px;padding:10px 12px;margin:2px 0 8px;color:#e8e8ee}
 .tg-dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px 10px;font-size:.82em;color:#9a9ca8;margin:4px 0 6px;padding-bottom:10px;line-height:1.35}
 .tg-dgrid b{display:block;color:#e8e8ee;font-size:1.1em}
@@ -1186,7 +1206,8 @@ if VIEW == "top":
         with st.container(key=f"tgwrap_{top_mkt.split()[0]}"):
             st.markdown(
                 f"<div class='tg-title'>Top Buys &amp; Sells</div>"
-                f"<div class='tg-upd'>Updated at {upd}{note}<br>{n_buy} BUY · {n_sell} SELL · tap a company for its chart</div>"
+                f"<div class='tg-upd'>Updated at {upd}{note}<br>{n_buy} BUY · {n_sell} SELL · tap a company for its chart<br>"
+                f"☑ tick <b>Bought</b> when you buy · untick when you sell</div>"
                 f"<div class='tg-head'><span>Rank</span><span>Company</span><span class='r'>Chg%</span>"
                 f"<span class='r'>Buy / Sell</span></div>", unsafe_allow_html=True)
             if not rows:
@@ -1200,12 +1221,10 @@ if VIEW == "top":
                     if st.button("Open", key=f"tgbtn_{sym}", width="stretch"):
                         st.session_state["top_detail"] = None if sel == sym else sym
                         st.rerun()
-                    holding = sym in held
-                    if st.button("💼 Holding" if holding else "✅ I bought", key=f"tgbought_{sym}", disabled=holding,
-                                 help="Tap after you buy it in your broker: I'll track it and tell you when to sell"):
-                        if record_buy(sym, float(r["Price"]), 0.0, r.get("Stop-loss"), r.get("Target"), bars.get(sym)):
-                            st.session_state["_goto"] = "trades"
-                            st.rerun()
+                    ck = f"tgchk_{sym}"
+                    st.session_state[ck] = sym in held          # the box always shows what you really hold
+                    st.checkbox("Bought", key=ck, on_change=_tick_changed,
+                                args=(ck, sym, float(r["Price"]), r.get("Stop-loss"), r.get("Target")))
                 if sel == sym:
                     try:
                         detail_panel(sym, r, bars[sym], top_h)
