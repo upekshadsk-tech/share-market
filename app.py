@@ -893,9 +893,10 @@ def trade_chart(t: dict, bars: pd.DataFrame | None, price: float, key: str):
         return
     t0 = pd.Timestamp(t["time"]).tz_convert(bars.index.tz)
     b = bars[bars.index >= t0 - pd.Timedelta(minutes=1)]
-    if b.empty:
-        st.caption("Chart starts after the first minute of trading since you bought.")
-        return
+    waiting = False
+    if len(b) < 2:          # bought while the market is closed (or just now): show the latest session for now
+        b = bars[bars.index.date == bars.index[-1].date()]
+        waiting = True
     if len(b) > 400:                       # held for days: 5-minute bars keep the chart readable
         b = b.resample("5min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last",
                                     "Volume": "sum"}).dropna()
@@ -926,8 +927,12 @@ def trade_chart(t: dict, bars: pd.DataFrame | None, price: float, key: str):
     up = int((pl > 0).sum()); down = int((pl < 0).sum())
     last5 = pl.iloc[-1] - pl.iloc[-6] if len(pl) > 5 else 0
     trend = "📈 rising" if last5 > 0.05 else "📉 falling" if last5 < -0.05 else "➖ flat"
-    st.caption(f"{len(pl)} bars since you bought · {up} in profit · {down} at a loss · last 5 bars: {trend} "
-               f"({last5:+.2f}%)")
+    if waiting:
+        st.caption(f"Market closed or just opened: showing the latest session ({b.index[-1]:%a %d %b}) against your "
+                   "buy price. From the next minute of trading, the chart follows your share live.")
+    else:
+        st.caption(f"{len(pl)} bars since you bought · {up} in profit · {down} at a loss · last 5 bars: {trend} "
+                   f"({last5:+.2f}%)")
 
 
 TRADE_CSS = """
