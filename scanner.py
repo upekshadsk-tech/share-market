@@ -146,8 +146,8 @@ def largest_shares(market: str, size: int) -> pd.DataFrame:
             return df
     except Exception:
         pass
-    from universe import FALLBACK
-    return pd.DataFrame({"Symbol": FALLBACK[market], "Company": FALLBACK[market]})
+    from universe import FALLBACK, name_of
+    return pd.DataFrame({"Symbol": FALLBACK[market], "Company": [name_of(x) for x in FALLBACK[market]]})
 
 
 def _largest_shares(market: str, size: int) -> pd.DataFrame:
@@ -262,7 +262,8 @@ def fallback_live(market: str) -> pd.DataFrame:
         hi, lo, price = float(row["High"]), float(row["Low"]), float(row["Close"])
         avg = d["Volume"].iloc[max(0, i - 20):i].mean()
         vol = float(row["Volume"])
-        out.append({"Symbol": sym, "Company": sym.split(".")[0], "Market": market, "Price": price,
+        from universe import name_of
+        out.append({"Symbol": sym, "Company": name_of(sym), "Market": market, "Price": price,
                     "Day %": (price / float(prev["Close"]) - 1) * 100,
                     "Volume ×": vol / (avg * elapsed) if avg else 1.0,
                     "Near day high": (price - lo) / (hi - lo) if hi > lo else 0.5,

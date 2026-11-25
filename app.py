@@ -121,7 +121,19 @@ def _base_query(market: str):
 
 @st.cache_data(ttl=24 * 3600, show_spinner="Loading full company list (once a day)...")
 def company_list(market: str) -> pd.DataFrame:
-    """Every listed equity in a market, paged from Yahoo's screener."""
+    """Every listed equity in a market (Yahoo's screener), or the built-in main companies if it's blocked."""
+    try:
+        df = _company_list_screener(market)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+    from universe import FALLBACK, name_of
+    return pd.DataFrame({"Symbol": FALLBACK[market], "Company": [name_of(x) for x in FALLBACK[market]],
+                         "Price": None, "Market cap": None})
+
+
+def _company_list_screener(market: str) -> pd.DataFrame:
     rows, offset = [], 0
     while offset < 12000:
         batch = _screen_rows(Q("and", [_base_query(market), Q("gt", ["intradayprice", 0])]),
@@ -798,6 +810,11 @@ def detail_panel(sym: str, r: dict, bars: pd.DataFrame, horizon: int):
                 f"last 15 minutes with its normal noise. A guide, not a forecast. "
                 + (f"This signal was right {r['Right %']:.0f}% of the time over {r['History days']} days."
                    if r.get("Right %") is not None else "") + "</span></div>", unsafe_allow_html=True)
+        in_wl = sym in st.session_state.watchlist
+        if st.button("⭐ In My Shares" if in_wl else "⭐ Add to My Shares", key=f"tgwl_{sym}", disabled=in_wl):
+            save_watchlist(list(dict.fromkeys(st.session_state.watchlist + [sym])))
+            st.toast(f"⭐ {sym} added to My Shares")
+            st.rerun()
         if True:   # always available (you may buy pre-market, or on delayed ASX/NZX prices)
             if market_of(sym) not in open_markets(my_tz):
                 st.caption("⚠️ This market is closed now. You can still record a buy you made.")
@@ -1557,6 +1574,10 @@ if VIEW == "signals":
 
 # ---------------------------------------------------------------- 5. Pick companies
 if VIEW == "pick":
+    st.markdown("**Tick ⭐ the shares you want to follow, then tap Save.** No need to search: the list below "
+                "shows each market's companies, largest first. These become **⚡ My Shares**.")
+    if st.session_state.watchlist:
+        st.caption("My shares now: " + ", ".join(st.session_state.watchlist))
     market = st.radio("Market", list(MARKETS), horizontal=True)
     try:
         all_cos = company_list(market)
@@ -1564,7 +1585,7 @@ if VIEW == "pick":
         all_cos = pd.DataFrame(columns=["Symbol", "Company", "Price", "Market cap"])
         st.warning(f"Couldn't load the company list ({e}). You can still add a ticker below.")
 
-    search = st.text_input("Search by name or ticker", placeholder="e.g. Apple, BHP, Fisher & Paykel")
+    search = st.text_input("Search (optional)", placeholder="e.g. Apple, BHP, Fisher & Paykel")
     view = all_cos
     if search:
         s = search.lower()
@@ -1579,7 +1600,12 @@ if VIEW == "pick":
         column_config={"Watch": st.column_config.CheckboxColumn("⭐ Watch"),
                        "Market cap": st.column_config.NumberColumn(format="compact")},
         key=f"editor_{market}_{search}")
-    if st.button("Save my selection", type="primary"):
+    n_ticked = int(edited["Watch"].sum()) if not edited.empty else 0
+    b1, b2 = st.columns(2)
+    if b2.button("Untick all in this market"):
+        save_watchlist([x for x in st.session_state.watchlist if market_of(x) != market])
+        st.rerun()
+    if b1.button(f"💾 Save my selection ({n_ticked} ticked here)", type="primary"):
         ticked = set(edited.loc[edited["Watch"], "Symbol"])
         shown = set(edited["Symbol"])
         keep = [s for s in st.session_state.watchlist if s not in shown or s in ticked]
