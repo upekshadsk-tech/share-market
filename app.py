@@ -714,6 +714,10 @@ RANK_CSS = """
 .tg-badge{display:inline-block;font-weight:800;font-size:.95em;padding:1px 6px;border-radius:5px;margin-right:5px}
 .tg-badge.buy{background:#123d27;color:#34d77c}.tg-badge.sell{background:#0d3550;color:#5cc8ff}
 .tg-badge.wait{background:#2a2c36;color:#9a9ca8}
+.tg-mkt{display:inline-block;font-weight:800;font-size:.85em;padding:0 5px;border-radius:4px;margin-left:6px;
+        border:1px solid}
+.tg-mkt.us{color:#7cb7ff;border-color:#2f5d8f}.tg-mkt.asx{color:#f5c542;border-color:#7a6320}
+.tg-mkt.nzx{color:#c9cad3;border-color:#555866}
 .tg-chg{text-align:right;font-size:1.08em;font-weight:600}
 .tg-chg.up{color:#25c26e}.tg-chg.down{color:#ff5a4f}
 .tg-pct{display:flex;justify-content:space-between;font-size:.82em;font-weight:600}
@@ -745,6 +749,40 @@ RANK_CSS = """
 """
 
 
+def market_tag(sym: str) -> str:
+    m = market_of(sym)
+    code = {"USA": "us", "Australia (ASX)": "asx", "New Zealand (NZX)": "nzx"}[m]
+    label = {"us": "🇺🇸 US", "asx": "🇦🇺 ASX", "nzx": "🇳🇿 NZX"}[code]
+    return f"<span class='tg-mkt {code}'>{label}</span>"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_universe() -> pd.DataFrame:
+    """Names + tickers to search across all three markets (built-in main companies + each market's list)."""
+    from universe import NAMES
+    rows = [{"Symbol": k, "Company": v} for k, v in NAMES.items()]
+    for m in MARKETS:
+        try:
+            cl = company_list(m)
+            rows += cl[["Symbol", "Company"]].to_dict("records")
+        except Exception:
+            pass
+    return pd.DataFrame(rows).dropna().drop_duplicates("Symbol")
+
+
+def search_matches(q: str, limit: int = 8) -> list[str]:
+    q = q.strip().lower()
+    if not q:
+        return []
+    u = search_universe()
+    sym = u["Symbol"].str.lower()
+    base = sym.str.replace(r"\.(ax|nz)$", "", regex=True)
+    hit = u[(base == q) | sym.str.startswith(q) | u["Company"].str.lower().str.contains(q, regex=False)]
+    # exact ticker first, then ticker starts-with, then name matches
+    hit = hit.assign(_o=(base[hit.index] != q).astype(int) + (~sym[hit.index].str.startswith(q)).astype(int))
+    return hit.sort_values("_o")["Symbol"].head(limit).tolist()
+
+
 def rank_row(i: int, r: dict, live_src, selected: bool = False) -> str:
     rk = f"r{i}" if i <= 3 else ""
     badge = {"BUY NOW": ("buy", "BUY"), "SELL NOW": ("sell", "SELL")}.get(r["Action"], ("wait", "WAIT"))
@@ -764,7 +802,8 @@ def rank_row(i: int, r: dict, live_src, selected: bool = False) -> str:
     name = (r.get("Company") or r["Symbol"]).replace("<", "")
     return (f"<div class='tg-row{' sel' if selected else ''}'><div class='tg-rank {rk}'>{i}</div>"
             f"<div style='min-width:0'><div class='tg-co'>{name}</div>"
-            f"<div class='tg-sub'><span class='tg-badge {badge[0]}'>{badge[1]}</span>{r['Symbol']}</div></div>"
+            f"<div class='tg-sub'><span class='tg-badge {badge[0]}'>{badge[1]}</span>{r['Symbol']}"
+            f"{market_tag(r['Symbol'])}</div></div>"
             f"<div class='tg-chg {'up' if chg >= 0 else 'down'}'>{chg:+.2f}%</div>"
             f"<div>{bar}</div>"
             f"<div class='tg-det'>Price <b>{r['Price']:,.3f}</b>{live}{right}{plan}</div></div>")
@@ -1118,6 +1157,8 @@ if VIEW == "top":
                "before": f"Day before · {day_label(sess[1])}" if len(sess) > 1 else ""}
     top_day = st.segmented_control("Day", day_opts, default="latest", key="top_day",
                                    format_func=lambda k: day_lbl[k], label_visibility="collapsed") or "latest"
+    top_search = st.text_input("🔍 Search", key="top_search", placeholder="Search any share: name or ticker "
+                               "(e.g. Apple, BHP, Air New Zealand, FPH)", label_visibility="collapsed").strip()
     top_rising = st.checkbox("📈 Only rising shares that are good to buy", key="top_rising",
                              help="Shows shares that are up today with an upward signal. BUY signals first.")
     with st.expander("⚙️ Options", expanded=False):
@@ -1222,6 +1263,30 @@ if VIEW == "top":
             act = {"BUY NOW": 0, "SELL NOW": 0}.get(r["Action"], 1)
             return (act, -(r["Right %"] or 0), -abs(r["Score"]))
         rows.sort(key=order)
+        if top_search:
+            q = top_search.lower()
+            found = [r for r in rows if q in r["Symbol"].lower() or q in str(r.get("Company") or "").lower()]
+            extra = [x for x in search_matches(top_search) if x not in {r["Symbol"] for r in found}]
+            if extra:
+                with st.spinner(f"Searching all markets: {', '.join(extra[:6])}…"):
+                    xb = bars_many(tuple(extra))
+                    xpc = prev_closes(tuple(extra))
+                names = search_universe().set_index("Symbol")["Company"].to_dict()
+                for x in extra:
+                    b_ = xb.get(x)
+                    if b_ is None or b_.empty or len(b_) < 30:
+                        continue
+                    try:
+                        rx = fix_day_change(live_signal(x, b_, None, top_h, top_hit), xpc.get(x))
+                    except Exception:
+                        continue
+                    rx["Company"] = names.get(x, x)
+                    rx["Pressure"] = buy_sell_pressure(b_)
+                    found.append(rx)
+                    bars[x] = b_
+            rows = found
+            if not rows:
+                st.info(f"No share found for “{top_search}”. Try the ticker (e.g. AAPL, BHP.AX, AIR.NZ).")
         if top_rising:
             rows = [r for r in rows if (r.get("Day %") or 0) > 0 and (r["Action"] == "BUY NOW" or (r.get("Score") or 0) >= 2)]
         elif top_show.startswith("Only"):
